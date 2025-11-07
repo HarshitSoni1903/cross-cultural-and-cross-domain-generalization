@@ -1,11 +1,65 @@
 """
-Model architecture with XLM-RoBERTa base and regression head for rating prediction.
+Model architecture with XLM-RoBERTa base and rating prediction head.
+Supports both regression (continuous ratings) and classification (3-class: Negative, Neutral, Positive).
 """
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import AutoModel, AutoConfig
+
+
+class RatingClassificationHead(nn.Module):
+    """
+    Classification head for predicting sentiment categories.
+    
+    Outputs logits for 3 classes: Negative (0), Neutral (1), Positive (2).
+    """
+    
+    def __init__(self, input_dim: int, num_classes: int = 3):
+        """
+        Initialize classification head.
+        
+        Args:
+            input_dim: Dimension of input features (e.g., 768 for XLM-RoBERTa)
+            num_classes: Number of classes (default 3: Negative, Neutral, Positive)
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.classifier = nn.Linear(input_dim, num_classes)
+        
+    def forward(self, features: Tensor, labels: Tensor = None) -> dict:
+        """
+        Forward pass through classification head.
+        
+        Args:
+            features: Input features [batch_size, hidden_dim]
+            labels: True labels for computing classification loss (optional)
+            
+        Returns:
+            Dictionary containing:
+                - logits: Raw logits [batch_size, num_classes]
+                - predictions: Predicted class indices [batch_size]
+                - loss: Cross-entropy loss if labels provided
+        """
+        # Get logits
+        logits = self.classifier(features)  # [batch_size, num_classes]
+        
+        # Get predicted class indices
+        predictions = torch.argmax(logits, dim=-1)  # [batch_size]
+        
+        output = {
+            'logits': logits,
+            'predictions': predictions
+        }
+        
+        # Compute Cross-Entropy loss if labels provided
+        if labels is not None:
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(logits, labels)
+            output['loss'] = loss
+        
+        return output
 
 
 class RatingRegressionHead(nn.Module):
@@ -85,18 +139,28 @@ class RatingRegressionHead(nn.Module):
 
 class XLMROBERTaRating(nn.Module):
     """
-    XLM-RoBERTa model with regression head for rating prediction.
+    XLM-RoBERTa model with rating prediction head.
+    Supports both regression (continuous ratings) and classification (3-class sentiment).
     """
     
-    def __init__(self, model_name: str = "FacebookAI/xlm-roberta-base", num_classes: int = 5):
+    def __init__(
+        self, 
+        model_name: str = "FacebookAI/xlm-roberta-base", 
+        num_classes: int = 5,
+        task_type: str = "regression"
+    ):
         """
-        Initialize XLM-RoBERTa with regression head.
+        Initialize XLM-RoBERTa with rating prediction head.
         
         Args:
             model_name: HuggingFace model identifier
-            num_classes: Number of rating classes (kept for compatibility, default 5)
+            num_classes: Number of rating classes (for classification, default 3; for regression, ignored)
+            task_type: Type of task - "regression" or "classification"
         """
         super().__init__()
+        
+        self.task_type = task_type
+        self.num_classes = num_classes if task_type == "classification" else 5
         
         # Load base model
         self.config = AutoConfig.from_pretrained(model_name)
@@ -106,16 +170,26 @@ class XLMROBERTaRating(nn.Module):
         # for param in self.bert.embeddings.parameters():
         #     param.requires_grad = False
         
-        # Rating regression head
-        self.rating_head = RatingRegressionHead(input_dim=self.config.hidden_size)
+        # Choose head based on task type
+        if task_type == "classification":
+            self.rating_head = RatingClassificationHead(
+                input_dim=self.config.hidden_size,
+                num_classes=self.num_classes
+            )
+        else:  # regression
+            self.rating_head = RatingRegressionHead(input_dim=self.config.hidden_size)
         
-        # Initialize weights for the regressor
+        # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights for the regressor layer."""
-        nn.init.xavier_uniform_(self.rating_head.regressor.weight)
-        nn.init.zeros_(self.rating_head.regressor.bias)
+        """Initialize weights for the head layer."""
+        if self.task_type == "classification":
+            nn.init.xavier_uniform_(self.rating_head.classifier.weight)
+            nn.init.zeros_(self.rating_head.classifier.bias)
+        else:
+            nn.init.xavier_uniform_(self.rating_head.regressor.weight)
+            nn.init.zeros_(self.rating_head.regressor.bias)
     
     def forward(
         self,
@@ -152,49 +226,84 @@ class XLMROBERTaRating(nn.Module):
     def save_pretrained(self, save_directory: str):
         """Save model and tokenizer to directory."""
         self.bert.save_pretrained(save_directory)
-        torch.save(self.rating_head.state_dict(), f"{save_directory}/rating_head.pt")
+        head_filename = "classification_head.pt" if self.task_type == "classification" else "rating_head.pt"
+        torch.save(self.rating_head.state_dict(), f"{save_directory}/{head_filename}")
+        # Save task type for loading
+        import json
+        with open(f"{save_directory}/model_config.json", 'w') as f:
+            json.dump({
+                'task_type': self.task_type,
+                'num_classes': self.num_classes
+            }, f)
     
     @classmethod
-    def from_pretrained(cls, save_directory: str, num_classes: int = 5):
+    def from_pretrained(cls, save_directory: str, num_classes: int = None, task_type: str = None):
         """
         Load model from directory.
         
         Args:
             save_directory: Path to saved model directory
-            num_classes: Number of classes (kept for compatibility)
+            num_classes: Number of classes (if None, loaded from config)
+            task_type: Task type (if None, loaded from config)
             
         Returns:
             Loaded model instance
         """
-        model = cls(model_name=save_directory, num_classes=num_classes)
-        rating_path = f"{save_directory}/rating_head.pt"
-        if torch.cuda.is_available():
-            model.rating_head.load_state_dict(torch.load(rating_path))
+        # Try to load config
+        import json
+        import os
+        config_path = f"{save_directory}/model_config.json"
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                task_type = task_type or config.get('task_type', 'regression')
+                num_classes = num_classes or config.get('num_classes', 3 if task_type == 'classification' else 5)
         else:
-            model.rating_head.load_state_dict(torch.load(rating_path, map_location='cpu'))
+            # Default to regression for backward compatibility
+            task_type = task_type or 'regression'
+            num_classes = num_classes or (3 if task_type == 'classification' else 5)
+        
+        model = cls(model_name=save_directory, num_classes=num_classes, task_type=task_type)
+        head_filename = "classification_head.pt" if task_type == "classification" else "rating_head.pt"
+        rating_path = f"{save_directory}/{head_filename}"
+        if os.path.exists(rating_path):
+            if torch.cuda.is_available():
+                model.rating_head.load_state_dict(torch.load(rating_path))
+            else:
+                model.rating_head.load_state_dict(torch.load(rating_path, map_location='cpu'))
         return model
 
 
 if __name__ == "__main__":
-    # Test the model
-    model = XLMROBERTaRating(num_classes=5)
+    # Test regression model
+    print("Testing Regression Model:")
+    model_reg = XLMROBERTaRating(num_classes=5, task_type='regression')
     
-    # Create dummy inputs
     batch_size = 4
     seq_len = 128
     input_ids = torch.randint(0, 50000, (batch_size, seq_len))
     attention_mask = torch.ones(batch_size, seq_len)
-    labels = torch.randint(0, 5, (batch_size,))  # 0-4 labels
+    labels = torch.randint(0, 5, (batch_size,))  # 0-4 labels for regression
     
-    # Forward pass
-    output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    
+    output = model_reg(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     print(f"Output keys: {output.keys()}")
     print(f"Raw score shape: {output['raw_score'].shape}")
     print(f"Predictions: {output['predictions']}")
     print(f"Loss: {output['loss']:.4f}")
     
+    # Test classification model
+    print("\nTesting Classification Model:")
+    model_cls = XLMROBERTaRating(num_classes=3, task_type='classification')
+    
+    labels_cls = torch.randint(0, 3, (batch_size,))  # 0-2 labels for classification
+    
+    output_cls = model_cls(input_ids=input_ids, attention_mask=attention_mask, labels=labels_cls)
+    print(f"Output keys: {output_cls.keys()}")
+    print(f"Logits shape: {output_cls['logits'].shape}")
+    print(f"Predictions: {output_cls['predictions']}")
+    print(f"Loss: {output_cls['loss']:.4f}")
+    
     # Test without labels
-    output_no_labels = model(input_ids=input_ids, attention_mask=attention_mask)
+    output_no_labels = model_cls(input_ids=input_ids, attention_mask=attention_mask)
     print(f"\nPredictions without labels: {output_no_labels['predictions']}")
 

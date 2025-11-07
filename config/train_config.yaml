@@ -1,6 +1,9 @@
 model:
   base_model: "FacebookAI/xlm-roberta-base"
   num_labels: 5
+  task_type: "classification"  # "classification" or "regression"
+  # For classification: 3 classes (Negative=0, Neutral=1, Positive=2)
+  # For regression: continuous ratings 1-5
   
 training:
   batch_size: 8
@@ -11,9 +14,11 @@ training:
   max_length: 512
   
 data:
-  train_languages: ["en"]  # or ["fr"] or ["en", "fr"]
+  data_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/data"  # Base path to data directory. The dataset looks for {data_path}/amazon_review/language/train.jsonl
+  train_languages: ["fr"]  # Used only when use_translation=false. When use_translation=true, ALL available languages are used automatically.
+  use_translation: true  # true: use review_body_en from ALL available languages, false: use review_body from specified languages only
   output_dir: "./outputs"
   save_steps: 1000
-  eval_steps: 500
+  eval_steps: 1000
   logging_steps: 100
 
