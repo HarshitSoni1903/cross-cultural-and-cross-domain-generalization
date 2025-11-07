@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
+import json
+
+import numpy as np
 import torch
 import yaml
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
@@ -18,7 +21,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from amazon_review_dataset import create_train_dataloader, create_amazon_review_dataloaders
-from model import XLMROBERTaRating
+from model import XLMROBERTaRating, DualEncoderXLMROBERTaRating
 
 
 def get_available_languages(data_path: str) -> List[str]:
@@ -78,18 +81,44 @@ class Trainer:
         # Get task type and other configs
         self.task_type = config.get('model', {}).get('task_type', 'regression')  # 'classification' or 'regression'
         self.use_translation = config.get('data', {}).get('use_translation', False)
+        self.training_schema = config.get('model', {}).get('training_schema', 'single')  # 'single' or 'dual_encoder'
         num_classes = 3 if self.task_type == 'classification' else config['model'].get('num_labels', 5)
         
         print(f"Task type: {self.task_type}")
         print(f"Use translation: {self.use_translation}")
+        print(f"Training schema: {self.training_schema}")
         
-        # Setup model
-        self.model = XLMROBERTaRating(
-            model_name=config['model']['base_model'],
-            num_classes=num_classes,
-            task_type=self.task_type
-        )
-        self.model.to(self.device)
+        # Setup model based on training schema
+        if self.training_schema == 'dual_encoder':
+            # Dual-encoder mode: requires pre-trained encoder path
+            pretrained_path = config.get('model', {}).get('pretrained_encoder_path', '')
+            if not pretrained_path:
+                raise ValueError(
+                    "pretrained_encoder_path must be provided in config when training_schema='dual_encoder'"
+                )
+            
+            # Dual-encoder only supports classification
+            if self.task_type != 'classification':
+                raise ValueError("Dual-encoder mode only supports classification task now")
+            
+            print(f"Initializing dual-encoder model...")
+            print(f"Pre-trained encoder path: {pretrained_path}")
+            
+            self.model = DualEncoderXLMROBERTaRating(
+                pretrained_encoder_path=pretrained_path,
+                base_model_name=config['model']['base_model'],
+                num_classes=num_classes,
+                freeze_pretrained=True
+            )
+            self.model.to(self.device)
+        else:
+            # Single encoder mode (standard)
+            self.model = XLMROBERTaRating(
+                model_name=config['model']['base_model'],
+                num_classes=num_classes,
+                task_type=self.task_type
+            )
+            self.model.to(self.device)
         
         # Setup tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(config['model']['base_model'])
@@ -217,17 +246,33 @@ class Trainer:
         
         task_str = f"{self.task_type}_" if self.task_type != 'regression' else ""
         trans_str = "trans_" if self.use_translation else "orig_"
-        self.output_dir = self.base_output_dir / f"{task_str}{trans_str}{languages_str}_{self.timestamp}"
+        schema_str = "dual_" if self.training_schema == 'dual_encoder' else ""
+        self.output_dir = self.base_output_dir / f"{schema_str}{task_str}{trans_str}{languages_str}_{self.timestamp}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Output directory: {self.output_dir}")
     
     def setup_optimizer(self):
         """Setup optimizer and learning rate scheduler."""
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=self.config['training']['learning_rate'],
-            weight_decay=self.config['training']['weight_decay']
-        )
+        # For dual-encoder, only optimize new encoder and classifier (pre-trained encoder is frozen)
+        if self.training_schema == 'dual_encoder':
+            # Only optimize parameters that require gradients
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params_count = sum(p.numel() for p in trainable_params)
+            frozen_params_count = total_params - trainable_params_count
+            print(f"Trainable parameters: {trainable_params_count:,}")
+            print(f"Frozen parameters: {frozen_params_count:,}")
+            self.optimizer = AdamW(
+                trainable_params,
+                lr=self.config['training']['learning_rate'],
+                weight_decay=self.config['training']['weight_decay']
+            )
+        else:
+            self.optimizer = AdamW(
+                self.model.parameters(),
+                lr=self.config['training']['learning_rate'],
+                weight_decay=self.config['training']['weight_decay']
+            )
         
         # Calculate total training steps
         num_training_steps = len(self.train_loader) * self.config['training']['num_epochs']
@@ -246,24 +291,45 @@ class Trainer:
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         
         for step, batch in enumerate(progress_bar):
-            # Move batch to device
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            
-            # For regression, convert star_ratings (1-5) to labels (0-4)
-            # For classification, use normalized labels (0-2)
-            if self.task_type == 'regression':
+            # Get labels (always classification labels for dual-encoder, otherwise based on task_type)
+            if self.training_schema == 'dual_encoder':
+                # Dual-encoder always uses classification labels
+                labels = batch['labels'].to(self.device)
+            elif self.task_type == 'regression':
                 star_ratings = batch['star_ratings'].to(self.device)
                 labels = star_ratings - 1  # Convert 1-5 to 0-4
             else:
                 labels = batch['labels'].to(self.device)
             
-            # Forward pass
-            output = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            # Forward pass based on training schema
+            if self.training_schema == 'dual_encoder':
+                # Dual-encoder: 
+                # - Frozen encoder (pretrained): uses translated text (or original text for English reviews)
+                # - Trainable encoder: uses original text
+                # Note: For English reviews, both encoders use the same original English text
+                input_ids_translated = batch['input_ids_translated'].to(self.device)
+                attention_mask_translated = batch['attention_mask_translated'].to(self.device)
+                input_ids_original = batch['input_ids_original'].to(self.device)
+                attention_mask_original = batch['attention_mask_original'].to(self.device)
+                
+                output = self.model(
+                    input_ids_translated=input_ids_translated,
+                    attention_mask_translated=attention_mask_translated,
+                    input_ids_original=input_ids_original,
+                    attention_mask_original=attention_mask_original,
+                    labels=labels
+                )
+            else:
+                # Single encoder: standard forward pass
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                
+                output = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+            
             loss = output['loss']
             
             # Backward pass
@@ -293,24 +359,46 @@ class Trainer:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"{split_name} Evaluation"):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                
-                # For regression, convert star_ratings (1-5) to labels (0-4)
-                # For classification, use normalized labels (0-2)
-                if self.task_type == 'regression':
+                # Get labels
+                if self.training_schema == 'dual_encoder':
+                    # Dual-encoder always uses classification labels
+                    labels = batch['labels'].to(self.device)
+                elif self.task_type == 'regression':
                     star_ratings = batch['star_ratings'].to(self.device)
                     labels = star_ratings - 1  # Convert 1-5 to 0-4
                     all_star_ratings.extend(star_ratings.cpu().tolist())
                 else:
                     labels = batch['labels'].to(self.device)
                 
-                # Forward pass
-                output = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                # Forward pass based on training schema
+                if self.training_schema == 'dual_encoder':
+                    # Dual-encoder:
+                    # - Frozen encoder (pretrained): uses translated text (or original text for English reviews)
+                    # - Trainable encoder: uses original text
+                    # Note: For English reviews, both encoders use the same original English text
+                    input_ids_translated = batch['input_ids_translated'].to(self.device)
+                    attention_mask_translated = batch['attention_mask_translated'].to(self.device)
+                    input_ids_original = batch['input_ids_original'].to(self.device)
+                    attention_mask_original = batch['attention_mask_original'].to(self.device)
+                    
+                    output = self.model(
+                        input_ids_translated=input_ids_translated,
+                        attention_mask_translated=attention_mask_translated,
+                        input_ids_original=input_ids_original,
+                        attention_mask_original=attention_mask_original,
+                        labels=labels
+                    )
+                else:
+                    # Single encoder: standard forward pass
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    
+                    output = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                
                 loss = output['loss']
                 
                 # Collect predictions and labels
@@ -321,7 +409,10 @@ class Trainer:
                 all_predictions.extend(predictions.tolist())
                 all_labels.extend(labels_cpu.tolist())
         
-        if self.task_type == 'classification':
+        # Determine effective task type (dual-encoder is always classification)
+        effective_task_type = 'classification' if self.training_schema == 'dual_encoder' else self.task_type
+        
+        if effective_task_type == 'classification':
             # Classification metrics
             all_predictions = torch.tensor(all_predictions, dtype=torch.long)
             all_labels = torch.tensor(all_labels, dtype=torch.long)
@@ -424,13 +515,58 @@ class Trainer:
         
         print(f"\nSaved checkpoint to {checkpoint_dir}")
     
+    def save_test_results(self, test_metrics: Dict):
+        """Save test results to JSON file."""
+        import json
+        
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_to_serializable(obj):
+            if isinstance(obj, (np.integer, np.floating)):
+                return obj.item()
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(item) for item in obj]
+            return obj
+        
+        # Add metadata to metrics
+        results = {
+            'training_schema': self.training_schema,
+            'task_type': self.task_type,
+            'languages': self.languages_used,
+            'use_translation': self.use_translation,
+            'test_samples': len(self.test_loader.dataset),
+            'metrics': convert_to_serializable(test_metrics)
+        }
+        
+        # Add pretrained encoder path for dual-encoder mode
+        if self.training_schema == 'dual_encoder':
+            results['pretrained_encoder_path'] = self.config.get('model', {}).get('pretrained_encoder_path', '')
+        
+        # Save to JSON file
+        results_path = self.output_dir / "test_results.json"
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nTest results saved to {results_path}")
+    
     def train(self):
         """Full training loop."""
         print("\n" + "="*50)
         print("Starting Training")
         print("="*50)
+        print(f"Training schema: {self.training_schema}")
         print(f"Task type: {self.task_type}")
         print(f"Use translation: {self.use_translation}")
+        
+        if self.training_schema == 'dual_encoder':
+            print(f"Dual-encoder mode:")
+            print(f"  - Pre-trained encoder: frozen, processes translated text (original text for English)")
+            print(f"  - New encoder: trainable, processes original text")
+            print(f"  - Classifier: concatenates features from both encoders")
+            print(f"  - Note: For English reviews, both encoders use the same original English text")
         
         # Show which languages are being used (from setup_data)
         if self.use_translation:
@@ -471,10 +607,16 @@ class Trainer:
         test_metrics = self.evaluate(self.test_loader, "Test")
         print(f"\nTest Metrics:")
         self._print_metrics(test_metrics)
+        
+        # Save test results to file
+        self.save_test_results(test_metrics)
     
     def _print_metrics(self, metrics: Dict):
         """Print metrics based on task type."""
-        if self.task_type == 'classification':
+        # Determine effective task type (dual-encoder is always classification)
+        effective_task_type = 'classification' if self.training_schema == 'dual_encoder' else self.task_type
+        
+        if effective_task_type == 'classification':
             print(f"  Loss (CE): {metrics['loss']:.4f}")
             print(f"  Accuracy: {metrics['accuracy']:.4f}")
             print(f"  Precision (macro): {metrics['precision_macro']:.4f}")

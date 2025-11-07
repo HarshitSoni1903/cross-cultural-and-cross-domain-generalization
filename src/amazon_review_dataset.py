@@ -148,9 +148,6 @@ class AmazonReviewDataset(Dataset):
         """Get a single data sample."""
         item = self.data[idx]
         
-        # Choose text based on use_translation flag
-        text = item['review_body_en'] if self.use_translation else item['review_body']
-        
         # Prepare output
         output = {
             'language': item['language'],
@@ -165,6 +162,11 @@ class AmazonReviewDataset(Dataset):
         
         # Tokenize if tokenizer is provided
         if self.tokenizer is not None:
+            # Choose text based on use_translation flag
+            # Note: For dual-encoder mode, we need both texts, so use_translation is ignored here
+            # The training script will handle tokenizing both separately
+            text = item['review_body_en'] if self.use_translation else item['review_body']
+            
             encoding = self.tokenizer(
                 text,
                 truncation=True,
@@ -174,6 +176,39 @@ class AmazonReviewDataset(Dataset):
             )
             output['input_ids'] = encoding['input_ids'].squeeze()
             output['attention_mask'] = encoding['attention_mask'].squeeze()
+            
+            # Also tokenize the other text for dual-encoder mode
+            # For English reviews: use original text for both encoders
+            # For non-English reviews: use translated text for frozen encoder, original text for trainable encoder
+            text_original = item['review_body']
+            language = item['language']
+            
+            if language == 'en' or language == 'en-US':
+                # For English: use original text for both translated and original
+                text_for_translated_encoder = text_original
+            else:
+                # For non-English: use translated text for frozen encoder
+                text_for_translated_encoder = item['review_body_en']
+            
+            encoding_original = self.tokenizer(
+                text_original,
+                truncation=True,
+                padding='max_length',
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            encoding_translated = self.tokenizer(
+                text_for_translated_encoder,
+                truncation=True,
+                padding='max_length',
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            
+            output['input_ids_original'] = encoding_original['input_ids'].squeeze()
+            output['attention_mask_original'] = encoding_original['attention_mask'].squeeze()
+            output['input_ids_translated'] = encoding_translated['input_ids'].squeeze()
+            output['attention_mask_translated'] = encoding_translated['attention_mask'].squeeze()
         
         return output
 
@@ -220,6 +255,10 @@ def create_amazon_review_dataloaders(
         return {
             'input_ids': torch.stack([item['input_ids'] for item in batch]),
             'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
+            'input_ids_original': torch.stack([item['input_ids_original'] for item in batch]),
+            'attention_mask_original': torch.stack([item['attention_mask_original'] for item in batch]),
+            'input_ids_translated': torch.stack([item['input_ids_translated'] for item in batch]),
+            'attention_mask_translated': torch.stack([item['attention_mask_translated'] for item in batch]),
             'labels': torch.tensor([item['labels'] for item in batch], dtype=torch.long),
             'normalized_labels': torch.tensor([item['normalized_label'] for item in batch], dtype=torch.long),
             'star_ratings': torch.tensor([item['star_rating'] for item in batch], dtype=torch.long),

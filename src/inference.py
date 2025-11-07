@@ -1,12 +1,16 @@
 """
 Inference module for loading trained models and making predictions.
+Supports both classification (3-class sentiment) and regression (continuous ratings).
 """
 
 import argparse
+import json
+import os
 from pathlib import Path
 from typing import List, Union, Dict
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from model import XLMROBERTaRating
@@ -31,36 +35,52 @@ class SentimentPredictor:
         print(f"Loading model from {model_path}")
         print(f"Using device: {self.device}")
         
-        # Load model
+        # Load model (task_type will be auto-detected from saved config)
         self.model = XLMROBERTaRating.from_pretrained(model_path)
         self.model.to(self.device)
         self.model.eval()
         
+        # Detect task type from model
+        self.task_type = self.model.task_type
+        print(f"Task type: {self.task_type}")
+        
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        # Class names for classification
+        self.class_names = ['Negative', 'Neutral', 'Positive']
         
         print("Model loaded successfully!")
     
     def predict_single(
         self,
-        review_title: str,
-        review_body: str
+        review_body: str,
+        review_title: str = ""
     ) -> Dict:
         """
         Predict sentiment for a single review.
         
         Args:
-            review_title: Review title text
-            review_body: Review body text
+            review_body: Review body text (required)
+            review_title: Review title text (optional)
             
         Returns:
             Dictionary with:
-                - prediction: Predicted star rating (1-5)
+                - For classification:
+                    - prediction: Class index (0=Negative, 1=Neutral, 2=Positive)
+                    - class_name: Class name (Negative/Neutral/Positive)
+                    - probabilities: Probabilities for each class
+                    - logits: Raw logits
+                - For regression:
+                    - prediction: Predicted star rating (1-5)
+                    - raw_score: Raw unclipped regression score
                 - text: Combined review text
-                - raw_score: Raw unclipped regression score
         """
-        # Combine title and body
-        review_text = f"{review_title}\n{review_body}"
+        # Combine title and body (if title provided)
+        if review_title:
+            review_text = f"{review_title}\n{review_body}"
+        else:
+            review_text = review_body
         
         # Tokenize
         encoding = self.tokenizer(
@@ -81,14 +101,35 @@ class SentimentPredictor:
                 attention_mask=attention_mask
             )
         
-        prediction = output['predictions'].item()
-        raw_score = output['raw_score'].item()
-        
         result = {
-            'prediction': prediction,
             'text': review_text,
-            'raw_score': raw_score
+            'task_type': self.task_type
         }
+        
+        if self.task_type == 'classification':
+            # Classification output
+            prediction_idx = output['predictions'].item()
+            logits = output['logits'].cpu()
+            probabilities = F.softmax(logits, dim=-1).squeeze().tolist()
+            
+            result.update({
+                'prediction': int(prediction_idx),
+                'class_name': self.class_names[prediction_idx],
+                'probabilities': {
+                    self.class_names[i]: prob 
+                    for i, prob in enumerate(probabilities)
+                },
+                'logits': logits.squeeze().tolist()
+            })
+        else:
+            # Regression output
+            prediction = output['predictions'].item()
+            raw_score = output['raw_score'].item()
+            
+            result.update({
+                'prediction': float(prediction),
+                'raw_score': float(raw_score)
+            })
         
         return result
     
@@ -100,7 +141,7 @@ class SentimentPredictor:
         Predict sentiment for multiple reviews.
         
         Args:
-            reviews: List of dicts with 'review_title' and 'review_body' keys
+            reviews: List of dicts with 'review_body' key (and optionally 'review_title')
             
         Returns:
             List of prediction dictionaries
@@ -108,8 +149,8 @@ class SentimentPredictor:
         results = []
         for review in reviews:
             result = self.predict_single(
-                review_title=review['review_title'],
-                review_body=review['review_body']
+                review_body=review['review_body'],
+                review_title=review.get('review_title', '')
             )
             results.append(result)
         return results
@@ -125,14 +166,16 @@ def main():
         help='Path to saved model directory'
     )
     parser.add_argument(
-        '--title',
-        type=str,
-        help='Review title'
-    )
-    parser.add_argument(
         '--body',
         type=str,
-        help='Review body'
+        required=True,
+        help='Review body text (required)'
+    )
+    parser.add_argument(
+        '--title',
+        type=str,
+        default="",
+        help='Review title text (optional)'
     )
     parser.add_argument(
         '--device',
@@ -146,53 +189,29 @@ def main():
     # Initialize predictor
     predictor = SentimentPredictor(args.model_path, device=args.device)
     
-    if args.title and args.body:
-        # Single prediction
-        result = predictor.predict_single(
-            review_title=args.title,
-            review_body=args.body
-        )
-        
-        print("\n" + "="*50)
-        print("PREDICTION RESULT")
-        print("="*50)
+    # Single prediction
+    result = predictor.predict_single(
+        review_body=args.body,
+        review_title=args.title
+    )
+    
+    print("\n" + "="*50)
+    print("PREDICTION RESULT")
+    print("="*50)
+    
+    if result['task_type'] == 'classification':
+        print(f"Predicted Class: {result['class_name']} (Class {result['prediction']})")
+        print(f"\nClass Probabilities:")
+        for class_name, prob in result['probabilities'].items():
+            print(f"  {class_name}: {prob:.4f}")
+    else:
         print(f"Predicted Stars: {result['prediction']:.2f}/5")
         print(f"Raw Score: {result['raw_score']:.4f}")
-        
-        print("\nReview Text:")
-        print("-"*50)
-        print(result['text'][:200] + "..." if len(result['text']) > 200 else result['text'])
-        print("="*50)
-    else:
-        # Example predictions
-        print("\nRunning example predictions...")
-        
-        examples = [
-            {
-                'review_title': 'Great product!',
-                'review_body': 'I absolutely love this product. It works perfectly and exceeded my expectations. Highly recommend!'
-            },
-            {
-                'review_title': 'Not satisfied',
-                'review_body': 'The product broke after just one week. Very disappointed with the quality. Would not recommend.'
-            },
-            {
-                'review_title': 'Average',
-                'review_body': 'It works okay, nothing special. The price is reasonable but I expected more features.'
-            }
-        ]
-        
-        results = predictor.predict_batch(examples)
-        
-        print("\n" + "="*50)
-        print("EXAMPLE PREDICTIONS")
-        print("="*50)
-        
-        for i, result in enumerate(results, 1):
-            print(f"\nExample {i}:")
-            print(f"Predicted Stars: {result['prediction']:.2f}/5")
-            print(f"Raw Score: {result['raw_score']:.4f}")
-            print(f"\nReview: {result['text'][:100]}...")
+    
+    print("\nReview Text:")
+    print("-"*50)
+    print(result['text'][:200] + "..." if len(result['text']) > 200 else result['text'])
+    print("="*50)
 
 
 if __name__ == "__main__":

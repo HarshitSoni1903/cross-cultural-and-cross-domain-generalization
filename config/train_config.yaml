@@ -4,6 +4,10 @@ model:
   task_type: "classification"  # "classification" or "regression"
   # For classification: 3 classes (Negative=0, Neutral=1, Positive=2)
   # For regression: continuous ratings 1-5
+  training_schema: "dual_encoder"  # "single" or "dual_encoder"
+  # single: Standard single encoder training
+  # dual_encoder: Dual-encoder with frozen pre-trained encoder + trainable new encoder
+  pretrained_encoder_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/outputs/classification_trans_fr_20251107_103755/checkpoint-epoch-1"  # Path to pre-trained checkpoint (required if training_schema="dual_encoder")
   
 training:
   batch_size: 8
@@ -15,7 +19,7 @@ training:
   
 data:
   data_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/data"  # Base path to data directory. The dataset looks for {data_path}/amazon_review/language/train.jsonl
-  train_languages: ["fr"]  # Used only when use_translation=false. When use_translation=true, ALL available languages are used automatically.
+  train_languages: ["en","zh"]  # Used only when use_translation=false. When use_translation=true, ALL available languages are used automatically.
   use_translation: true  # true: use review_body_en from ALL available languages, false: use review_body from specified languages only
   output_dir: "./outputs"
   save_steps: 1000
