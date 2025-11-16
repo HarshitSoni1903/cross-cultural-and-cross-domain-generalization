@@ -35,7 +35,9 @@ class AmazonReviewDataset(Dataset):
         split: str = "train",
         tokenizer: Optional[AutoTokenizer] = None,
         max_length: int = 512,
-        use_translation: bool = False
+        use_translation: bool = False,
+        domain_info: bool = False,
+        training_schema: str = "single"
     ):
         """
         Initialize the dataset.
@@ -54,6 +56,8 @@ class AmazonReviewDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.use_translation = use_translation
+        self.domain_info = domain_info
+        self.training_schema = training_schema  # 'single' or 'dual_encoder'
         self.data = []
         
         # Load data from all specified languages
@@ -109,6 +113,7 @@ class AmazonReviewDataset(Dataset):
                     else:
                         star_rating = int(star_rating)
                     review_body_en = item.get('review_body_en', '')
+                    product_category = item.get('product_category', '')
                     
                     # For English samples, always use original review_body as review_body_en
                     if language == 'en' or lang == 'en':
@@ -126,6 +131,7 @@ class AmazonReviewDataset(Dataset):
                         'review_body': review_body,
                         'review_id': review_id,
                         'product_id': product_id,
+                        'product_category': product_category,
                         'star_rating': star_rating,
                         'review_body_en': review_body_en,
                         'normalized_label': normalized_label
@@ -160,55 +166,72 @@ class AmazonReviewDataset(Dataset):
             'labels': item['normalized_label']  # For compatibility with training code
         }
         
+        review_title = item.get('review_title', '')
+        product_category = item.get('product_category', '')
+        
+        # Add category prefix if domain_info is enabled
+        category_prefix = ""
+        if self.domain_info and product_category:
+            category_prefix = f"Category: {product_category}\n"
+
         # Tokenize if tokenizer is provided
         if self.tokenizer is not None:
-            # Choose text based on use_translation flag
-            # Note: For dual-encoder mode, we need both texts, so use_translation is ignored here
-            # The training script will handle tokenizing both separately
-            text = item['review_body_en'] if self.use_translation else item['review_body']
+            # Choose text based on use_translation flag (for single encoder mode)
+            # Note: For dual-encoder mode, we need both texts
+            if self.training_schema == 'single':
+                text = item['review_body_en'] if self.use_translation else item['review_body']
+                text = f"{category_prefix}{review_title}\n{text}"
+                
+                encoding = self.tokenizer(
+                    text,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                )
+                output['input_ids'] = encoding['input_ids'].squeeze()
+                output['attention_mask'] = encoding['attention_mask'].squeeze()
             
-            encoding = self.tokenizer(
-                text,
-                truncation=True,
-                padding='max_length',
-                max_length=self.max_length,
-                return_tensors='pt'
-            )
-            output['input_ids'] = encoding['input_ids'].squeeze()
-            output['attention_mask'] = encoding['attention_mask'].squeeze()
-            
-            # Also tokenize the other text for dual-encoder mode
+            # For dual-encoder mode, also tokenize the other text
             # For English reviews: use original text for both encoders
             # For non-English reviews: use translated text for frozen encoder, original text for trainable encoder
-            text_original = item['review_body']
-            language = item['language']
-            
-            if language == 'en' or language == 'en-US':
-                # For English: use original text for both translated and original
-                text_for_translated_encoder = text_original
+            elif self.training_schema == 'dual_encoder':
+                text_original = item['review_body']
+                text_original = f"{category_prefix}{review_title}\n{text_original}"
+                language = item['language']
+                
+                if language == 'en' or language == 'en-US':
+                    # For English: use original text for both translated and original
+                    text_for_translated_encoder = text_original
+                else:
+                    # For non-English: use translated text for frozen encoder
+                    # Note: category prefix is always in English (original label)
+                    text_for_translated_encoder = item['review_body_en']
+                    text_for_translated_encoder = f"{category_prefix}{review_title}\n{text_for_translated_encoder}"
+                
+                encoding_original = self.tokenizer(
+                    text_original,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                )
+                encoding_translated = self.tokenizer(
+                    text_for_translated_encoder,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                )
+                
+                output['input_ids_original'] = encoding_original['input_ids'].squeeze()
+                output['attention_mask_original'] = encoding_original['attention_mask'].squeeze()
+                output['input_ids_translated'] = encoding_translated['input_ids'].squeeze()
+                output['attention_mask_translated'] = encoding_translated['attention_mask'].squeeze()
             else:
-                # For non-English: use translated text for frozen encoder
-                text_for_translated_encoder = item['review_body_en']
-            
-            encoding_original = self.tokenizer(
-                text_original,
-                truncation=True,
-                padding='max_length',
-                max_length=self.max_length,
-                return_tensors='pt'
-            )
-            encoding_translated = self.tokenizer(
-                text_for_translated_encoder,
-                truncation=True,
-                padding='max_length',
-                max_length=self.max_length,
-                return_tensors='pt'
-            )
-            
-            output['input_ids_original'] = encoding_original['input_ids'].squeeze()
-            output['attention_mask_original'] = encoding_original['attention_mask'].squeeze()
-            output['input_ids_translated'] = encoding_translated['input_ids'].squeeze()
-            output['attention_mask_translated'] = encoding_translated['attention_mask'].squeeze()
+                assert False, "Training schema not supported"
+        else:
+            assert False, "Tokenizer is not provided"
         
         return output
 
@@ -221,7 +244,9 @@ def create_amazon_review_dataloaders(
     batch_size: int = 8,
     num_workers: int = 0,
     use_translation: bool = False,
-    split: str = "train"
+    split: str = "train",
+    domain_info: bool = False,
+    training_schema: str = "single"
 ) -> DataLoader:
     """
     Create dataloader for Amazon review data.
@@ -235,6 +260,8 @@ def create_amazon_review_dataloaders(
         num_workers: Number of worker processes
         use_translation: If True, use review_body_en; otherwise use review_body
         split: Dataset split ('train', 'validation', 'test') - currently only 'train' is used
+        domain_info: If True, add "Category: {category}" prefix to all texts
+        training_schema: "single" or "dual_encoder" - determines whether to create dual encodings
         
     Returns:
         DataLoader instance
@@ -246,19 +273,18 @@ def create_amazon_review_dataloaders(
         split=split,
         tokenizer=tokenizer,
         max_length=max_length,
-        use_translation=use_translation
+        use_translation=use_translation,
+        domain_info=domain_info,
+        training_schema=training_schema
     )
     
     # Create dataloader
+    # Capture training_schema in closure
+    schema = training_schema
+    
     def collate_fn(batch):
         """Custom collate function to stack tensors and preserve metadata."""
-        return {
-            'input_ids': torch.stack([item['input_ids'] for item in batch]),
-            'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-            'input_ids_original': torch.stack([item['input_ids_original'] for item in batch]),
-            'attention_mask_original': torch.stack([item['attention_mask_original'] for item in batch]),
-            'input_ids_translated': torch.stack([item['input_ids_translated'] for item in batch]),
-            'attention_mask_translated': torch.stack([item['attention_mask_translated'] for item in batch]),
+        result = {
             'labels': torch.tensor([item['labels'] for item in batch], dtype=torch.long),
             'normalized_labels': torch.tensor([item['normalized_label'] for item in batch], dtype=torch.long),
             'star_ratings': torch.tensor([item['star_rating'] for item in batch], dtype=torch.long),
@@ -268,6 +294,20 @@ def create_amazon_review_dataloaders(
             'review_bodies': [item['review_body'] for item in batch],
             'review_bodies_en': [item['review_body_en'] for item in batch]
         }
+        if schema == 'single':
+            result.update({
+                'input_ids': torch.stack([item['input_ids'] for item in batch]),
+                'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
+            })
+        elif schema == 'dual_encoder':
+            result.update({
+                'input_ids_original': torch.stack([item['input_ids_original'] for item in batch]),
+                'attention_mask_original': torch.stack([item['attention_mask_original'] for item in batch]),
+                'input_ids_translated': torch.stack([item['input_ids_translated'] for item in batch]),
+                'attention_mask_translated': torch.stack([item['attention_mask_translated'] for item in batch])
+            })
+        
+        return result
     
     dataloader = DataLoader(
         dataset,
@@ -287,7 +327,9 @@ def create_train_dataloader(
     max_length: int = 512,
     batch_size: int = 8,
     num_workers: int = 0,
-    use_translation: bool = False
+    use_translation: bool = False,
+    domain_info: bool = False,
+    training_schema: str = "single"
 ) -> DataLoader:
     """
     Convenience function to create a training dataloader.
@@ -312,7 +354,9 @@ def create_train_dataloader(
         batch_size=batch_size,
         num_workers=num_workers,
         use_translation=use_translation,
-        split='train'
+        split='train',
+        domain_info=domain_info,
+        training_schema=training_schema
     )
 
 

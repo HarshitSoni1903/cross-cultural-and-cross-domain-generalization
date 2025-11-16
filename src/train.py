@@ -178,8 +178,8 @@ class Trainer:
         # Store languages used for later display
         self.languages_used = languages_to_use
         
-        # Create train dataloader
-        from amazon_review_dataset import create_amazon_review_dataloaders
+        # Get domain_info from config
+        domain_info = self.config.get('data', {}).get('domain_info', False)
         
         self.train_loader = create_amazon_review_dataloaders(
             data_dir=data_path,
@@ -188,7 +188,9 @@ class Trainer:
             max_length=self.config['training']['max_length'],
             batch_size=self.config['training']['batch_size'],
             use_translation=self.use_translation,
-            split='train'
+            split='train',
+            domain_info=domain_info,
+            training_schema=self.training_schema
         )
         
         # Create validation dataloader
@@ -200,7 +202,9 @@ class Trainer:
                 max_length=self.config['training']['max_length'],
                 batch_size=self.config['training']['batch_size'],
                 use_translation=self.use_translation,
-                split='validation'
+                split='validation',
+                domain_info=domain_info,
+                training_schema=self.training_schema
             )
             # Check if validation dataset is empty
             if len(val_loader.dataset) == 0:
@@ -223,7 +227,9 @@ class Trainer:
                 max_length=self.config['training']['max_length'],
                 batch_size=self.config['training']['batch_size'],
                 use_translation=self.use_translation,
-                split='test'
+                split='test',
+                domain_info=domain_info,
+                training_schema=self.training_schema
             )
             # Check if test dataset is empty
             if len(test_loader.dataset) == 0:

@@ -305,6 +305,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         
         self.task_type = "classification"  # Dual-encoder only supports classification
         self.num_classes = num_classes
+        self.pretrained_encoder_path = pretrained_encoder_path
         
         # Load pre-trained encoder (frozen, inference only)
         print(f"Loading pre-trained encoder from {pretrained_encoder_path}")
