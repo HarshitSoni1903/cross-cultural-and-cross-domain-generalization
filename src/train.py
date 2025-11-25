@@ -17,6 +17,7 @@ import yaml
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
@@ -133,32 +134,33 @@ class Trainer:
         
         # Setup optimizer and scheduler
         self.setup_optimizer()
+        
+        # Setup TensorBoard logging
+        # Create log directory in outputs/log with the same name as output_dir
+        log_dir = self.base_output_dir / self.output_dir.name / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(log_dir))
+        self.log_dir = log_dir
+        print(f"TensorBoard logs will be saved to: {log_dir}")
     
     def setup_data(self):
         """Setup train, validation, and test dataloaders using amazon_review_dataset."""
         # Get data_path from config
         data_path = self.config['data'].get('data_path', 'data')
         print(f"Using data path: {data_path}")
-        
-        # If use_translation is True, use all available languages' English translations
-        # Otherwise, use only the specified languages with their original text
+
+        # Select languages according to config priority
         if self.use_translation:
-            # Get all available languages automatically
-            print("Attempting to detect available languages...")
-            available_languages = get_available_languages(data_path)
-            
-            # If no languages found, try to use train_languages as fallback
-            if not available_languages:
-                print("\n" + "="*60)
-                print("WARNING: Could not automatically detect languages.")
-                print("Attempting to use languages from config file as fallback...")
-                print("="*60 + "\n")
-                
-                # Fallback to using train_languages from config
-                fallback_languages = self.config['data'].get('train_languages', [])
-                if fallback_languages:
-                    print(f"Using fallback languages from config: {fallback_languages}")
-                    languages_to_use = fallback_languages
+            config_languages = self.config['data'].get('train_languages', [])
+            if config_languages:
+                print(f"Using translated data from config-specified languages: {config_languages}")
+                languages_to_use = config_languages
+            else:
+                print("No train_languages specified in config. Attempting to detect available languages...")
+                available_languages = get_available_languages(data_path)
+                if available_languages:
+                    print(f"Using translated data from ALL available languages: {available_languages}")
+                    languages_to_use = available_languages
                 else:
                     raise ValueError(
                         f"No available languages found in {data_path}/amazon_review/ directory.\n"
@@ -167,12 +169,13 @@ class Trainer:
                         f"  2. train.jsonl files exist for at least one language\n"
                         f"  3. Or set train_languages in config file\n"
                     )
-            else:
-                languages_to_use = available_languages
-                print(f"Using translated data from ALL available languages: {languages_to_use}")
         else:
             # Use only specified languages with original text
-            languages_to_use = self.config['data']['train_languages']
+            languages_to_use = self.config['data'].get('train_languages', [])
+            if not languages_to_use:
+                raise ValueError(
+                    "train_languages must be specified for non-translation (original text) mode."
+                )
             print(f"Using original text from specified languages: {languages_to_use}")
         
         # Store languages used for later display
@@ -348,14 +351,24 @@ class Trainer:
             total_loss += loss.item()
             progress_bar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / (step + 1)})
             
+            # Calculate global step for TensorBoard
+            global_step = (epoch - 1) * len(self.train_loader) + step
+            
+            # TensorBoard logging
+            self.writer.add_scalar('Train/Loss', loss.item(), global_step)
+            self.writer.add_scalar('Train/LearningRate', self.scheduler.get_last_lr()[0], global_step)
+            
             # Logging
             if step % self.config['data']['logging_steps'] == 0:
                 print(f"\nStep {step}, Loss: {loss.item():.4f}, LR: {self.scheduler.get_last_lr()[0]:.2e}")
         
         avg_loss = total_loss / len(self.train_loader)
+        # Log average training loss for the epoch
+        epoch_global_step = epoch * len(self.train_loader)
+        self.writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
         return avg_loss
     
-    def evaluate(self, dataloader: DataLoader, split_name: str = "Validation") -> Dict:
+    def evaluate(self, dataloader: DataLoader, split_name: str = "Validation", epoch: int = None) -> Dict:
         """Evaluate model on a dataset."""
         self.model.eval()
         total_loss = 0.0
@@ -472,6 +485,22 @@ class Trainer:
                 'class_metrics': class_metrics,
                 'confusion_matrix': cm.tolist()
             }
+            
+            # TensorBoard logging for classification metrics
+            if epoch is not None:
+                tag_prefix = f"{split_name}/"
+                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Precision_Macro', metrics['precision_macro'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Recall_Macro', metrics['recall_macro'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}F1_Macro', metrics['f1_macro'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}F1_Weighted', metrics['f1_weighted'], epoch)
+                
+                # Per-class metrics
+                for class_name, class_metric in class_metrics.items():
+                    self.writer.add_scalar(f'{tag_prefix}Precision_{class_name}', class_metric['precision'], epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Recall_{class_name}', class_metric['recall'], epoch)
+                    self.writer.add_scalar(f'{tag_prefix}F1_{class_name}', class_metric['f1'], epoch)
         else:
             # Regression metrics - use original star ratings (1-5)
             all_predictions = torch.tensor(all_predictions, dtype=torch.float32)
@@ -507,6 +536,16 @@ class Trainer:
                 'r2': r2,
                 'accuracy': accuracy
             }
+            
+            # TensorBoard logging for regression metrics
+            if epoch is not None:
+                tag_prefix = f"{split_name}/"
+                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}MAE', metrics['mae'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}MSE', metrics['mse'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}RMSE', metrics['rmse'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}R2', metrics['r2'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], epoch)
         
         return metrics
     
@@ -594,7 +633,7 @@ class Trainer:
             print(f"\nEpoch {epoch} - Train Loss: {train_loss:.4f}")
             
             # Evaluate
-            val_metrics = self.evaluate(self.val_loader, "Validation")
+            val_metrics = self.evaluate(self.val_loader, "Validation", epoch=epoch)
             print(f"\nValidation Metrics:")
             self._print_metrics(val_metrics)
             
@@ -610,12 +649,16 @@ class Trainer:
         
         # Final evaluation on test set
         print("\nEvaluating on test set...")
-        test_metrics = self.evaluate(self.test_loader, "Test")
+        test_metrics = self.evaluate(self.test_loader, "Test", epoch=self.config['training']['num_epochs'])
         print(f"\nTest Metrics:")
         self._print_metrics(test_metrics)
         
         # Save test results to file
         self.save_test_results(test_metrics)
+        
+        # Close TensorBoard writer
+        self.writer.close()
+        print(f"\nTensorBoard logs saved to: {self.log_dir}")
     
     def _print_metrics(self, metrics: Dict):
         """Print metrics based on task type."""
