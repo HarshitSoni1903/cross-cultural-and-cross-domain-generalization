@@ -83,3 +83,50 @@ source /ext3/miniforge3/etc/profile.d/conda.sh 2>/dev/null || true
 EOF
 chmod +x /ext3/env.sh
 ```
+
+# 5. Setting up env
+Confirm you are in singularity and the current active env is multilang.
+
+```bash
+conda env list
+```
+should point to multilang. If not, you can enter the singularity with 
+```bash
+multilang
+```
+This should bring you into the environment, and you can begin the installation of the necessary packages.
+
+
+# 6. Slurm Job
+Once the necessary pip installations are done, batch jobs can be scheduled. YOU DO NOT NEED TO DO SRUN in this; no job request is to be done manually, and is automatically taken care of when sbatch is executed. This command opens the environment in read-only mode, thus no pip or other installations are allowed. To schedule the job, save it in the HPC location with extension ".slurm" and code as follows:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=tr_ld
+#SBATCH --account=<account_name>
+#SBATCH --partition=<partition>
+#SBATCH --open-mode=append
+#SBATCH --output=./%j_%x.out
+#SBATCH --error=./%j_%x.err
+#SBATCH --export=ALL
+#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --requeue
+
+
+singularity exec --bind /scratch --nv --overlay  /scratch/$USER/multilang/overlay-50G-10M-fixed.ext3:ro /scratch/work/public/singularity/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif /bin/bash -c "
+set -euo pipefail
+source /ext3/miniforge3/etc/profile.d/conda.sh
+conda activate nlp
+cd /scratch/$USER/multilang/repo
+python src/train.py --config config/train_config_LD.yaml
+"
+```
+
+Once the .slurm file is created, you can execute with the following commands:
+
+```bash
+ssh burst
+cd <location to slurm file>
+sbatch <.slurm file>
+```
