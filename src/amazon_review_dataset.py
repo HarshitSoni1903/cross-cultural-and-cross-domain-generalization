@@ -180,7 +180,10 @@ class AmazonReviewDataset(Dataset):
             # Note: For dual-encoder mode, we need both texts
             if self.training_schema == 'single':
                 text = item['review_body_en'] if self.use_translation else item['review_body']
-                text = f"{category_prefix}{review_title}\n{text}"
+                if self.use_translation:
+                    text = f"{category_prefix}\n{text}"
+                else:
+                    text = f"{category_prefix}{review_title}\n{text}"
                 
                 encoding = self.tokenizer(
                     text,

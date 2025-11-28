@@ -386,9 +386,13 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         logits = self.classifier(combined_features)  # [batch_size, num_classes]
         predictions = torch.argmax(logits, dim=-1)  # [batch_size]
         
+        # Base outputs
         output = {
             'logits': logits,
-            'predictions': predictions
+            'predictions': predictions,
+            # Expose pooled encoder outputs for optional auxiliary losses (e.g., KL regularization)
+            'pretrained_pooled': pretrained_pooled,
+            'new_pooled': new_pooled,
         }
         
         # Compute Cross-Entropy loss if labels provided

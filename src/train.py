@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from amazon_review_dataset import create_train_dataloader, create_amazon_review_dataloaders
 from model import XLMROBERTaRating, DualEncoderXLMROBERTaRating
@@ -88,6 +89,19 @@ class Trainer:
         print(f"Task type: {self.task_type}")
         print(f"Use translation: {self.use_translation}")
         print(f"Training schema: {self.training_schema}")
+
+        # Optional KL regularization between frozen (NLND) encoder and LD encoder
+        training_cfg = config.get('training', {})
+        self.use_ld_kl_penalty = training_cfg.get('use_ld_kl_penalty', False)
+        self.ld_kl_weight = training_cfg.get('ld_kl_weight', 0.0)
+        # Clip the KL contribution so it cannot dominate the main task loss
+        # (acts as an upper bound on the raw KL value before weighting).
+        self.ld_kl_clip = training_cfg.get('ld_kl_clip', 1.0)
+        if self.training_schema != 'dual_encoder' and self.use_ld_kl_penalty:
+            print("Warning: use_ld_kl_penalty is enabled but training_schema is not 'dual_encoder'. "
+                  "The KL penalty will be ignored.")
+        if self.use_ld_kl_penalty:
+            print(f"LD KL penalty enabled with weight {self.ld_kl_weight}")
         
         # Setup model based on training schema
         if self.training_schema == 'dual_encoder':
@@ -340,6 +354,24 @@ class Trainer:
                 )
             
             loss = output['loss']
+
+            # Optional KL penalty between LD encoder (new_encoder) and frozen NLND encoder
+            if (
+                self.training_schema == 'dual_encoder'
+                and self.use_ld_kl_penalty
+                and self.ld_kl_weight > 0.0
+            ):
+                pretrained_pooled = output.get('pretrained_pooled')
+                new_pooled = output.get('new_pooled')
+                if pretrained_pooled is not None and new_pooled is not None:
+                    # Treat pooled outputs as unnormalized logits over hidden dimension
+                    # KL(new || pretrained) where pretrained acts as (frozen) target distribution
+                    log_p_new = F.log_softmax(new_pooled, dim=-1)
+                    p_pretrained = F.softmax(pretrained_pooled.detach(), dim=-1)
+                    kl_div = F.kl_div(log_p_new, p_pretrained, reduction='batchmean')
+                    # Clip KL so auxiliary term cannot overwhelm main task loss
+                    kl_div_clipped = torch.clamp(kl_div, max=self.ld_kl_clip)
+                    loss = loss - self.ld_kl_weight * kl_div_clipped
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -419,6 +451,21 @@ class Trainer:
                     )
                 
                 loss = output['loss']
+
+                # Apply the same KL penalty in evaluation loss if enabled
+                if (
+                    self.training_schema == 'dual_encoder'
+                    and self.use_ld_kl_penalty
+                    and self.ld_kl_weight > 0.0
+                ):
+                    pretrained_pooled = output.get('pretrained_pooled')
+                    new_pooled = output.get('new_pooled')
+                    if pretrained_pooled is not None and new_pooled is not None:
+                        log_p_new = F.log_softmax(new_pooled, dim=-1)
+                        p_pretrained = F.softmax(pretrained_pooled, dim=-1)
+                        kl_div = F.kl_div(log_p_new, p_pretrained, reduction='batchmean')
+                        kl_div_clipped = torch.clamp(kl_div, max=self.ld_kl_clip)
+                        loss = loss + self.ld_kl_weight * kl_div_clipped
                 
                 # Collect predictions and labels
                 predictions = output['predictions'].cpu()
