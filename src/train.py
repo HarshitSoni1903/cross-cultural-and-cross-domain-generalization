@@ -116,14 +116,33 @@ class Trainer:
             if self.task_type != 'classification':
                 raise ValueError("Dual-encoder mode only supports classification task now")
             
+            # Check if baseline checkpoint should be used for encoder initialization
+            use_baseline_checkpoint = config.get('model', {}).get('use_baseline_checkpoint_for_encoder', False)
+            baseline_checkpoint_path = config.get('model', {}).get('baseline_checkpoint_path', '')
+            
+            if use_baseline_checkpoint:
+                if not baseline_checkpoint_path:
+                    raise ValueError(
+                        "baseline_checkpoint_path must be provided in config when use_baseline_checkpoint_for_encoder=true"
+                    )
+                print(f"Baseline checkpoint enabled: will load new encoder from {baseline_checkpoint_path}")
+            
+            # Get classifier fusion method
+            classifier_fusion_method = config.get('model', {}).get('classifier_fusion_method', 'concat')
+            if classifier_fusion_method not in ['concat', 'residual']:
+                raise ValueError(f"classifier_fusion_method must be 'concat' or 'residual', got '{classifier_fusion_method}'")
+            
             print(f"Initializing dual-encoder model...")
             print(f"Pre-trained encoder path: {pretrained_path}")
+            print(f"Classifier fusion method: {classifier_fusion_method}")
             
             self.model = DualEncoderXLMROBERTaRating(
                 pretrained_encoder_path=pretrained_path,
                 base_model_name=config['model']['base_model'],
                 num_classes=num_classes,
-                freeze_pretrained=True
+                freeze_pretrained=True,
+                baseline_checkpoint_path=baseline_checkpoint_path if use_baseline_checkpoint else None,
+                classifier_fusion_method=classifier_fusion_method
             )
             self.model.to(self.device)
         else:
@@ -633,9 +652,10 @@ class Trainer:
             'metrics': convert_to_serializable(test_metrics)
         }
         
-        # Add pretrained encoder path for dual-encoder mode
+        # Add pretrained encoder path and classifier fusion method for dual-encoder mode
         if self.training_schema == 'dual_encoder':
             results['pretrained_encoder_path'] = self.config.get('model', {}).get('pretrained_encoder_path', '')
+            results['classifier_fusion_method'] = self.config.get('model', {}).get('classifier_fusion_method', 'concat')
         
         # Save to JSON file
         results_path = self.output_dir / "test_results.json"
@@ -654,10 +674,14 @@ class Trainer:
         print(f"Use translation: {self.use_translation}")
         
         if self.training_schema == 'dual_encoder':
+            classifier_fusion_method = self.config.get('model', {}).get('classifier_fusion_method', 'concat')
             print(f"Dual-encoder mode:")
             print(f"  - Pre-trained encoder: frozen, processes translated text (original text for English)")
             print(f"  - New encoder: trainable, processes original text")
-            print(f"  - Classifier: concatenates features from both encoders")
+            if classifier_fusion_method == "concat":
+                print(f"  - Classifier: concatenates features from both encoders")
+            else:  # residual
+                print(f"  - Classifier: NLND classifier + LD residual classifier (additive logits)")
             print(f"  - Note: For English reviews, both encoders use the same original English text")
         
         # Show which languages are being used (from setup_data)
