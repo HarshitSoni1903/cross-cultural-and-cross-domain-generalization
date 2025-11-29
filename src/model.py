@@ -294,7 +294,9 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         num_classes: int = 3,
         freeze_pretrained: bool = True,
         baseline_checkpoint_path: str = None,
-        classifier_fusion_method: str = "concat"
+        classifier_fusion_method: str = "concat",
+        nlnd_drop_prob: float = 0.0,
+        use_ld_masking: bool = False,
     ):
         """
         Initialize dual-encoder model.
@@ -313,6 +315,11 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         self.num_classes = num_classes
         self.pretrained_encoder_path = pretrained_encoder_path
         self.classifier_fusion_method = classifier_fusion_method
+        # NLND gating & (optional) branch-dropout / masking
+        # Initialized to -1 => sigmoid(-1) ~ 0.27, so we start leaned towards LD.
+        self.nlnd_gate = nn.Parameter(torch.tensor(-1.0))
+        self.nlnd_drop_prob = float(nlnd_drop_prob)
+        self.use_ld_masking = bool(use_ld_masking)
         
         if classifier_fusion_method not in ["concat", "residual"]:
             raise ValueError(f"classifier_fusion_method must be 'concat' or 'residual', got '{classifier_fusion_method}'")
@@ -412,7 +419,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             attention_mask=attention_mask_translated,
             return_dict=True
         )
-        pretrained_pooled = pretrained_outputs.last_hidden_state[:, 0, :]  # [batch_size, hidden_size]
+        pretrained_pooled = pretrained_outputs.last_hidden_state[:, 0, :].detach()  # [batch_size, hidden_size]
         
         # Forward through new encoder (trainable, original text)
         new_outputs = self.new_encoder(
@@ -429,16 +436,51 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             
             # Pass through classifier
             logits = self.classifier(combined_features)  # [batch_size, num_classes]
-        else:  # residual
-            # NLND classifier on pretrained encoder output
-            logits_nlnd = self.pretrained_classifier(pretrained_pooled)  # [batch_size, num_classes]
-            
+        elif self.classifier_fusion_method == "residual":  # residual
+            # Gate in (0, 1) controlling how much NLND contributes.
+            gate = torch.sigmoid(self.nlnd_gate)
+
+            # Optional gated masking applied at the NLND embedding level.
+            if self.use_ld_masking:
+                # Start by scaling with the global gate.
+                mask_factor = gate
+                # Optional branch-dropout (per example) on NLND path.
+                if self.training and self.nlnd_drop_prob > 0.0:
+                    m = torch.bernoulli(
+                        torch.full(
+                            (pretrained_pooled.size(0), 1),
+                            1.0 - self.nlnd_drop_prob,
+                            device=pretrained_pooled.device,
+                        )
+                    )
+                    # Inverted dropout scaling to keep expectation fixed.
+                    mask_factor = mask_factor * (m / (1.0 - self.nlnd_drop_prob))
+                pretrained_pooled_for_cls = pretrained_pooled * mask_factor
+                logits_nlnd = self.pretrained_classifier(pretrained_pooled_for_cls)  # [batch_size, num_classes]
+            else:
+                # Standard NLND logits from frozen classifier.
+                logits_nlnd = self.pretrained_classifier(pretrained_pooled)  # [batch_size, num_classes]
+                # Optional branch-dropout directly on NLND logits.
+                if self.training and self.nlnd_drop_prob > 0.0:
+                    m = torch.bernoulli(
+                        torch.full(
+                            (logits_nlnd.size(0), 1),
+                            1.0 - self.nlnd_drop_prob,
+                            device=logits_nlnd.device,
+                        )
+                    )
+                    logits_nlnd = logits_nlnd * m / (1.0 - self.nlnd_drop_prob)
+                # Always apply global gate at logit level in this branch.
+                logits_nlnd = gate * logits_nlnd
+
             # LD classifier on new encoder output (predicts residual)
             logits_residual = self.ld_classifier(new_pooled)  # [batch_size, num_classes]
-            
+
             # Add logits together
             logits = logits_nlnd + logits_residual  # [batch_size, num_classes]
-        
+        else:
+            raise ValueError(f"Invalid classifier fusion method: {self.classifier_fusion_method}")
+            
         predictions = torch.argmax(logits, dim=-1)  # [batch_size]
         
         # Base outputs

@@ -131,10 +131,20 @@ class Trainer:
             classifier_fusion_method = config.get('model', {}).get('classifier_fusion_method', 'concat')
             if classifier_fusion_method not in ['concat', 'residual']:
                 raise ValueError(f"classifier_fusion_method must be 'concat' or 'residual', got '{classifier_fusion_method}'")
+
+            # Optional NLND gating & dropout/masking controls for dual-encoder residual fusion.
+            # - nlnd_drop_prob: branch-dropout probability on NLND path
+            # - use_ld_masking: if true, apply gated masking at the NLND embedding level instead of only at logits
+            nlnd_drop_prob = float(config.get('model', {}).get('nlnd_drop_prob', 0.0))
+            use_ld_masking = bool(config.get('model', {}).get('use_ld_masking', False))
+            if nlnd_drop_prob < 0.0 or nlnd_drop_prob >= 1.0:
+                raise ValueError(f"nlnd_drop_prob must be in [0, 1), got {nlnd_drop_prob}")
             
             print(f"Initializing dual-encoder model...")
             print(f"Pre-trained encoder path: {pretrained_path}")
             print(f"Classifier fusion method: {classifier_fusion_method}")
+            print(f"NLND drop prob: {nlnd_drop_prob}")
+            print(f"Use LD masking on NLND embedding: {use_ld_masking}")
             
             self.model = DualEncoderXLMROBERTaRating(
                 pretrained_encoder_path=pretrained_path,
@@ -142,7 +152,9 @@ class Trainer:
                 num_classes=num_classes,
                 freeze_pretrained=True,
                 baseline_checkpoint_path=baseline_checkpoint_path if use_baseline_checkpoint else None,
-                classifier_fusion_method=classifier_fusion_method
+                classifier_fusion_method=classifier_fusion_method,
+                nlnd_drop_prob=nlnd_drop_prob,
+                use_ld_masking=use_ld_masking,
             )
             self.model.to(self.device)
         else:
