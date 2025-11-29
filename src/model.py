@@ -431,8 +431,30 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         
         # Compute logits based on fusion method
         if self.classifier_fusion_method == "concat":
+            # Gate in (0, 1) controlling how much NLND contributes.
+            gate = torch.sigmoid(self.nlnd_gate)
+            
+            # Optional gated masking applied at the NLND embedding level.
+            if self.use_ld_masking:
+                # Start by scaling with the global gate.
+                mask_factor = gate
+                # Optional branch-dropout (per example) on NLND path.
+                if self.training and self.nlnd_drop_prob > 0.0:
+                    m = torch.bernoulli(
+                        torch.full(
+                            (pretrained_pooled.size(0), 1),
+                            1.0 - self.nlnd_drop_prob,
+                            device=pretrained_pooled.device,
+                        )
+                    )
+                    # Inverted dropout scaling to keep expectation fixed.
+                    mask_factor = mask_factor * (m / (1.0 - self.nlnd_drop_prob))
+                pretrained_pooled_for_concat = pretrained_pooled * mask_factor
+            else:
+                pretrained_pooled_for_concat = pretrained_pooled
+            
             # Concatenate features from both encoders
-            combined_features = torch.cat([pretrained_pooled, new_pooled], dim=-1)  # [batch_size, 2*hidden_size]
+            combined_features = torch.cat([pretrained_pooled_for_concat, new_pooled], dim=-1)  # [batch_size, 2*hidden_size]
             
             # Pass through classifier
             logits = self.classifier(combined_features)  # [batch_size, num_classes]
