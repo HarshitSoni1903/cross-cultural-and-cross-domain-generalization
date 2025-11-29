@@ -8,14 +8,32 @@ model:
   # single: Standard single encoder training
   # dual_encoder: Dual-encoder with frozen pre-trained encoder + trainable new encoder
   pretrained_encoder_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/outputs/classification_trans_fr_20251107_103755/checkpoint-epoch-1"  # Path to pre-trained checkpoint (required if training_schema="dual_encoder")
+  # pretrained_encoder_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/outputs/NLND/classification_trans_all_20251125_002315/checkpoint-epoch-1"  # Path to pre-trained checkpoint (required if training_schema="dual_encoder")
+  # Option to load the new encoder from a baseline checkpoint instead of initializing from scratch
+  use_baseline_checkpoint_for_encoder: false  # If true, load the new encoder from baseline_checkpoint_path
+  baseline_checkpoint_path: ""  # Path to baseline checkpoint (required if use_baseline_checkpoint_for_encoder=true)
+  # Classifier fusion method: "concat" or "residual"
+  # "concat": Concatenate embeddings from both encoders and use a single classifier (default)
+  # "residual": Use NLND classifier on pretrained encoder output, LD classifier on new encoder output, add logits
+  classifier_fusion_method: "concat"  # "concat" or "residual"
+  # Optional NLND gating & dropout/masking (used in dual-encoder residual fusion)
+  # nlnd_drop_prob: probability of dropping the NLND branch (with inverted scaling) when training.
+  # use_ld_masking: if true, apply gated masking at the NLND embedding level for the dual model.
+  nlnd_drop_prob: 0.3
+  use_ld_masking: false
   
 training:
-  batch_size: 8
-  learning_rate: 0.00002  # 2e-5 as float
+  batch_size: 16
+  learning_rate: 0.00001
   num_epochs: 1
   warmup_steps: 500
   weight_decay: 0.01
   max_length: 512
+  # Optional KL penalty between LD encoder (trainable) and frozen NLND encoder.
+  # If omitted, defaults to not using this penalty and to clipping the KL at 1.0.
+  use_ld_kl_penalty: true
+  ld_kl_weight: 0.01  # strength of KL regularization when enabled
+  ld_kl_clip: 0.5     # maximum raw KL value before weighting (prevents auxiliary loss dominating)
   
 data:
   data_path: "/mnt/e/code/cross-cultural-and-cross-domain-generalization/data"  # Base path to data directory. The dataset looks for {data_path}/amazon_review/language/train.jsonl
