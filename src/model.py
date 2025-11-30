@@ -269,9 +269,9 @@ class XLMROBERTaRating(nn.Module):
         rating_path = f"{save_directory}/{head_filename}"
         if os.path.exists(rating_path):
             if torch.cuda.is_available():
-                model.rating_head.load_state_dict(torch.load(rating_path))
+                model.rating_head.load_state_dict(torch.load(rating_path, weights_only=False))
             else:
-                model.rating_head.load_state_dict(torch.load(rating_path, map_location='cpu'))
+                model.rating_head.load_state_dict(torch.load(rating_path, map_location='cpu', weights_only=False))
         return model
 
 
@@ -359,12 +359,16 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             self.pretrained_classifier = None
             self.ld_classifier = None
         else:  # residual
+            # Create new dense layer for LD encoder output (no LD masking)
+            print(f"Creating dense layer for LD encoder output")
+            self.ld_dense = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+            
             # Load NLND classifier from pretrained model
             print(f"Loading NLND classifier from pretrained model")
-            self.pretrained_classifier = pretrained_model.rating_head.classifier
-            # Freeze NLND classifier
+            self.nlnd_classifier = pretrained_model.rating_head.classifier
+            # Freeze NLND classifier if pretrained encoder is frozen
             if freeze_pretrained:
-                for param in self.pretrained_classifier.parameters():
+                for param in self.nlnd_classifier.parameters():
                     param.requires_grad = False
                 print("NLND classifier frozen")
             else:
@@ -373,6 +377,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # Create new LD classifier for residual prediction
             print(f"Creating LD residual classifier")
             self.ld_classifier = nn.Linear(self.config.hidden_size, num_classes)
+            self.pretrained_classifier = None
             self.classifier = None
         
         # Initialize classifier weights
@@ -384,6 +389,10 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             nn.init.xavier_uniform_(self.classifier.weight)
             nn.init.zeros_(self.classifier.bias)
         else:  # residual
+            # Initialize dense layer weights
+            nn.init.xavier_uniform_(self.ld_dense.weight)
+            nn.init.zeros_(self.ld_dense.bias)
+            # NLND classifier is loaded from pretrained checkpoint, so don't initialize
             # Initialize LD classifier weights
             nn.init.xavier_uniform_(self.ld_classifier.weight)
             nn.init.zeros_(self.ld_classifier.bias)
@@ -429,6 +438,10 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         )
         new_pooled = new_outputs.last_hidden_state[:, 0, :]  # [batch_size, hidden_size]
         
+        # Initialize logits_nlnd and logits_residual to None (will be set in residual method)
+        logits_nlnd = None
+        logits_residual = None
+        
         # Compute logits based on fusion method
         if self.classifier_fusion_method == "concat":
             # Gate in (0, 1) controlling how much NLND contributes.
@@ -459,44 +472,14 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # Pass through classifier
             logits = self.classifier(combined_features)  # [batch_size, num_classes]
         elif self.classifier_fusion_method == "residual":  # residual
-            # Gate in (0, 1) controlling how much NLND contributes.
-            gate = torch.sigmoid(self.nlnd_gate)
-
-            # Optional gated masking applied at the NLND embedding level.
-            if self.use_ld_masking:
-                # Start by scaling with the global gate.
-                mask_factor = gate
-                # Optional branch-dropout (per example) on NLND path.
-                if self.training and self.nlnd_drop_prob > 0.0:
-                    m = torch.bernoulli(
-                        torch.full(
-                            (pretrained_pooled.size(0), 1),
-                            1.0 - self.nlnd_drop_prob,
-                            device=pretrained_pooled.device,
-                        )
-                    )
-                    # Inverted dropout scaling to keep expectation fixed.
-                    mask_factor = mask_factor * (m / (1.0 - self.nlnd_drop_prob))
-                pretrained_pooled_for_cls = pretrained_pooled * mask_factor
-                logits_nlnd = self.pretrained_classifier(pretrained_pooled_for_cls)  # [batch_size, num_classes]
-            else:
-                # Standard NLND logits from frozen classifier.
-                logits_nlnd = self.pretrained_classifier(pretrained_pooled)  # [batch_size, num_classes]
-                # Optional branch-dropout directly on NLND logits.
-                if self.training and self.nlnd_drop_prob > 0.0:
-                    m = torch.bernoulli(
-                        torch.full(
-                            (logits_nlnd.size(0), 1),
-                            1.0 - self.nlnd_drop_prob,
-                            device=logits_nlnd.device,
-                        )
-                    )
-                    logits_nlnd = logits_nlnd * m / (1.0 - self.nlnd_drop_prob)
-                # Always apply global gate at logit level in this branch.
-                logits_nlnd = gate * logits_nlnd
-
-            # LD classifier on new encoder output (predicts residual)
-            logits_residual = self.ld_classifier(new_pooled)  # [batch_size, num_classes]
+            # Process LD encoder output through dense layer (no LD masking)
+            ld_processed = self.ld_dense(new_pooled)  # [batch_size, hidden_size]
+            
+            # NLND classifier on pretrained encoder output
+            logits_nlnd = self.nlnd_classifier(pretrained_pooled)  # [batch_size, num_classes]
+            
+            # LD classifier on processed LD encoder output (predicts residual)
+            logits_residual = self.ld_classifier(ld_processed)  # [batch_size, num_classes]
 
             # Add logits together
             logits = logits_nlnd + logits_residual  # [batch_size, num_classes]
@@ -509,18 +492,141 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         output = {
             'logits': logits,
             'predictions': predictions,
+            # Expose individual logits for loss calculation
+            'logits_nlnd': logits_nlnd,
+            'logits_residual': logits_residual,
             # Expose pooled encoder outputs for optional auxiliary losses (e.g., KL regularization)
             'pretrained_pooled': pretrained_pooled,
             'new_pooled': new_pooled,
         }
         
-        # Compute Cross-Entropy loss if labels provided
+        # Compute loss if labels provided
         if labels is not None:
-            criterion = nn.CrossEntropyLoss()
-            loss = criterion(logits, labels)
-            output['loss'] = loss
+            if self.classifier_fusion_method == "residual":
+                # Custom loss calculation for residual method
+                loss_dict = self._compute_residual_loss(
+                    logits_nlnd, logits_residual, logits, labels
+                )
+                output['loss'] = loss_dict['total_loss']
+                # Add individual loss components to output for TensorBoard logging
+                output['loss_components'] = {
+                    'loss_nlnd': loss_dict['loss_nlnd'],
+                    'loss_combined': loss_dict['loss_combined'],
+                    'penalty_combined': loss_dict['penalty_combined'],
+                    'reward': loss_dict['reward'],
+                }
+            else:
+                # Standard Cross-Entropy loss for concat method (no changes)
+                criterion = nn.CrossEntropyLoss()
+                loss = criterion(logits, labels)
+                output['loss'] = loss
         
         return output
+    
+    def _compute_residual_loss(
+        self, 
+        logits_nlnd: Tensor, 
+        logits_residual: Tensor, 
+        logits_combined: Tensor, 
+        labels: Tensor
+    ) -> dict:
+        """
+        Compute loss for residual fusion method.
+        
+        Args:
+            logits_nlnd: NLND prediction logits [batch_size, num_classes]
+            logits_residual: LD residual prediction logits [batch_size, num_classes]
+            logits_combined: Combined logits (nlnd + residual) [batch_size, num_classes]
+            labels: True labels [batch_size]
+            
+        Returns:
+            Dictionary containing:
+                - total_loss: Combined loss tensor
+                - loss_nlnd: NLND loss (scalar, mean)
+                - loss_combined: Combined loss (scalar, mean)
+                - penalty_combined: Opposite polarity penalty (scalar)
+                - reward: Reward for loss decrease (scalar, mean)
+        """
+        criterion = nn.CrossEntropyLoss(reduction='none')  # Per-sample loss
+        
+        # 1. NLND loss: standard cross-entropy with true labels
+        loss_nlnd = criterion(logits_nlnd, labels)  # [batch_size]
+        loss_nlnd_mean = loss_nlnd.mean()  # Scalar
+        
+        # 2. Combined loss: standard cross-entropy on final logits (nlnd + residual)
+        loss_combined = criterion(logits_combined, labels)  # [batch_size]
+        loss_combined_mean = loss_combined.mean()  # Scalar
+        
+        # 3. Reward mechanism: reward when combined loss decreases compared to NLND loss
+        # Reward is proportional to the loss decrease
+        loss_decrease = loss_nlnd - loss_combined  # [batch_size]
+        # Only reward when loss decreases (loss_decrease > 0)
+        reward = torch.clamp(loss_decrease, min=0.0)  # [batch_size], only positive values
+        reward_mean = reward.mean()  # Scalar
+        
+        # 4. Add opposite polarity penalty based on logit values (not predictions)
+        # Penalty applies even when predictions are correct
+        penalty_combined = self._compute_opposite_polarity_penalty_from_logits(logits_combined, labels)
+        
+        # Combine losses: base losses + penalties - reward
+        total_loss = (
+            # loss_nlnd.mean()  # NLND loss
+            loss_combined_mean  # Combined loss
+            + penalty_combined  # Combined opposite polarity penalty
+            - reward_mean  # Reward for loss decrease (subtract to reduce loss)
+        )
+        
+        return {
+            'total_loss': total_loss,
+            'loss_nlnd': loss_nlnd_mean,
+            'loss_combined': loss_combined_mean,
+            'penalty_combined': penalty_combined,
+            'reward': reward_mean,
+        }
+    
+    def _compute_opposite_polarity_penalty_from_logits(self, logits: Tensor, labels: Tensor) -> Tensor:
+        """
+        Compute penalty for opposite polarity based on logit values (not predictions).
+        Penalizes high logits for opposite class even when prediction is correct.
+        
+        Args:
+            logits: Prediction logits [batch_size, num_classes]
+            labels: True labels [batch_size]
+            
+        Returns:
+            Penalty scalar (averaged over batch)
+        """
+        batch_size = logits.size(0)
+        if batch_size == 0:
+            return torch.tensor(0.0, device=logits.device)
+        
+        # Initialize penalty per sample
+        penalty_per_sample = torch.zeros(batch_size, device=logits.device)
+        
+        # When label is 0 (negative), penalize high logits for class 2 (positive)
+        # When label is 2 (positive), penalize high logits for class 0 (negative)
+        label_0_mask = (labels == 0)  # [batch_size]
+        label_2_mask = (labels == 2)  # [batch_size]
+        
+        # Penalty for label=0: high positive logit (class 2)
+        if label_0_mask.any():
+            # Get positive logits for samples with label=0
+            positive_logits = logits[label_0_mask, 2]  # [num_label_0]
+            # Use ReLU to only penalize positive logits (softmax will make them more likely)
+            penalty_per_sample[label_0_mask] = torch.clamp(positive_logits, min=0.0)
+        
+        # Penalty for label=2: high negative logit (class 0)
+        if label_2_mask.any():
+            # Get negative logits for samples with label=2
+            negative_logits = logits[label_2_mask, 0]  # [num_label_2]
+            # Use ReLU to only penalize positive logits (softmax will make them more likely)
+            penalty_per_sample[label_2_mask] = torch.clamp(negative_logits, min=0.0)
+        
+        # Average penalty over batch
+        penalty = penalty_per_sample.mean()
+        
+        return penalty * 2  # Scale penalty weight
+    
     
     def save_pretrained(self, save_directory: str):
         """Save model to directory."""
@@ -533,8 +639,10 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         if self.classifier_fusion_method == "concat":
             torch.save(self.classifier.state_dict(), f"{save_directory}/classifier.pt")
         else:  # residual
+            torch.save(self.ld_dense.state_dict(), f"{save_directory}/ld_dense.pt")
+            # Save NLND classifier (loaded from pretrained, but may have been trained if freeze_pretrained=False)
+            torch.save(self.nlnd_classifier.state_dict(), f"{save_directory}/nlnd_classifier.pt")
             torch.save(self.ld_classifier.state_dict(), f"{save_directory}/ld_classifier.pt")
-            # Note: pretrained_classifier is not saved as it comes from pretrained_encoder_path
         
         # Save config
         with open(f"{save_directory}/model_config.json", 'w') as f:
@@ -594,16 +702,30 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             classifier_path = f"{save_directory}/classifier.pt"
             if os.path.exists(classifier_path):
                 if torch.cuda.is_available():
-                    model.classifier.load_state_dict(torch.load(classifier_path))
+                    model.classifier.load_state_dict(torch.load(classifier_path, weights_only=False))
                 else:
-                    model.classifier.load_state_dict(torch.load(classifier_path, map_location='cpu'))
+                    model.classifier.load_state_dict(torch.load(classifier_path, map_location='cpu', weights_only=False))
         else:  # residual
+            ld_dense_path = f"{save_directory}/ld_dense.pt"
+            if os.path.exists(ld_dense_path):
+                if torch.cuda.is_available():
+                    model.ld_dense.load_state_dict(torch.load(ld_dense_path, weights_only=False))
+                else:
+                    model.ld_dense.load_state_dict(torch.load(ld_dense_path, map_location='cpu', weights_only=False))
+            
+            nlnd_classifier_path = f"{save_directory}/nlnd_classifier.pt"
+            if os.path.exists(nlnd_classifier_path):
+                if torch.cuda.is_available():
+                    model.nlnd_classifier.load_state_dict(torch.load(nlnd_classifier_path, weights_only=False))
+                else:
+                    model.nlnd_classifier.load_state_dict(torch.load(nlnd_classifier_path, map_location='cpu', weights_only=False))
+            
             ld_classifier_path = f"{save_directory}/ld_classifier.pt"
             if os.path.exists(ld_classifier_path):
                 if torch.cuda.is_available():
-                    model.ld_classifier.load_state_dict(torch.load(ld_classifier_path))
+                    model.ld_classifier.load_state_dict(torch.load(ld_classifier_path, weights_only=False))
                 else:
-                    model.ld_classifier.load_state_dict(torch.load(ld_classifier_path, map_location='cpu'))
+                    model.ld_classifier.load_state_dict(torch.load(ld_classifier_path, map_location='cpu', weights_only=False))
         
         return model
 

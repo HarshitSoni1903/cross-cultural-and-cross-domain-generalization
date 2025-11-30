@@ -421,6 +421,15 @@ class Trainer:
             self.writer.add_scalar('Train/Loss', loss.item(), global_step)
             self.writer.add_scalar('Train/LearningRate', self.scheduler.get_last_lr()[0], global_step)
             
+            # Log residual loss components if available
+            if self.training_schema == 'dual_encoder' and self.model.classifier_fusion_method == "residual":
+                loss_components = output.get('loss_components')
+                if loss_components is not None:
+                    self.writer.add_scalar('Train/Residual/Loss_NLND', loss_components['loss_nlnd'].item(), global_step)
+                    self.writer.add_scalar('Train/Residual/Loss_Combined', loss_components['loss_combined'].item(), global_step)
+                    self.writer.add_scalar('Train/Residual/Penalty_Combined', loss_components['penalty_combined'].item(), global_step)
+                    self.writer.add_scalar('Train/Residual/Reward', loss_components['reward'].item(), global_step)
+            
             # Logging
             if step % self.config['data']['logging_steps'] == 0:
                 print(f"\nStep {step}, Loss: {loss.item():.4f}, LR: {self.scheduler.get_last_lr()[0]:.2e}")
@@ -438,6 +447,13 @@ class Trainer:
         all_predictions = []
         all_labels = []
         all_star_ratings = []
+        
+        # Track residual loss components if applicable
+        total_loss_nlnd = 0.0
+        total_loss_combined = 0.0
+        total_penalty_combined = 0.0
+        total_reward = 0.0
+        num_batches_with_components = 0
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc=f"{split_name} Evaluation"):
@@ -482,6 +498,15 @@ class Trainer:
                     )
                 
                 loss = output['loss']
+                
+                # Collect residual loss components if available
+                loss_components = output.get('loss_components')
+                if loss_components is not None:
+                    total_loss_nlnd += loss_components['loss_nlnd'].item()
+                    total_loss_combined += loss_components['loss_combined'].item()
+                    total_penalty_combined += loss_components['penalty_combined'].item()
+                    total_reward += loss_components['reward'].item()
+                    num_batches_with_components += 1
 
                 # Apply the same KL penalty in evaluation loss if enabled
                 if (
@@ -573,6 +598,13 @@ class Trainer:
                 self.writer.add_scalar(f'{tag_prefix}Recall_Macro', metrics['recall_macro'], epoch)
                 self.writer.add_scalar(f'{tag_prefix}F1_Macro', metrics['f1_macro'], epoch)
                 self.writer.add_scalar(f'{tag_prefix}F1_Weighted', metrics['f1_weighted'], epoch)
+                
+                # Log residual loss components if available
+                if num_batches_with_components > 0:
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_NLND', total_loss_nlnd / num_batches_with_components, epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_Combined', total_loss_combined / num_batches_with_components, epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Penalty_Combined', total_penalty_combined / num_batches_with_components, epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Reward', total_reward / num_batches_with_components, epoch)
                 
                 # Per-class metrics
                 for class_name, class_metric in class_metrics.items():
