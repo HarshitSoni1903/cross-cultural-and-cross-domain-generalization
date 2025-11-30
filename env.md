@@ -6,7 +6,7 @@ Create a working directory and copy the base overlay and Singularity image:
 ```bash
 mkdir -p /scratch/$USER/multilang
 cd /scratch/$USER/multilang
-cp -rp /scratch/work/public/overlay-fs-ext3/overlay-50GB-10M.ext3.gz .
+cp -rp /scratch/work/public/overlay-fs-ext3/overlay-50G-10M.ext3.gz .
 gunzip overlay-50GB-10M.ext3.gz
 ```
 
