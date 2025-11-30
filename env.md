@@ -7,8 +7,10 @@ Create a working directory and copy the base overlay and Singularity image:
 mkdir -p /scratch/$USER/multilang
 cd /scratch/$USER/multilang
 cp -rp /scratch/work/public/overlay-fs-ext3/overlay-50G-10M.ext3.gz .
-gunzip overlay-50GB-10M.ext3.gz
+gunzip overlay-50G-10M.ext3.gz
 ```
+
+
 
 # 2. Multilang Launcher Creation
 Paste this entire block into your terminal to create the launcher script that automatically starts Singularity with RW overlay and activates the Conda environment.
@@ -59,7 +61,10 @@ chmod +x ~/multilang
 echo "alias multilang='~/multilang'" >> ~/.bashrc
 source ~/.bashrc
 ```
-
+## Singularity Start
+```bash
+singularity exec --nv --bind /scratch --overlay /scratch/$USER/multilang/overlay-50G-10M.ext3:rw /scratch/work/public/singularity/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif /bin/bash
+```
 # 3. One-Time Conda and Miniforge Setup
 Run these commands manually inside the Singularity shell (launched manually once) to install Conda and prepare the base environment.
 
