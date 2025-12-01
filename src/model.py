@@ -6,6 +6,7 @@ Also supports dual-encoder architecture with frozen pre-trained encoder and trai
 
 import json
 import os
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -297,6 +298,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         classifier_fusion_method: str = "concat",
         nlnd_drop_prob: float = 0.0,
         use_ld_masking: bool = False,
+        use_language_embeddings: bool = False,
     ):
         """
         Initialize dual-encoder model.
@@ -308,6 +310,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             freeze_pretrained: Whether to freeze the pre-trained encoder (default True)
             baseline_checkpoint_path: Optional path to baseline checkpoint to load encoder from. If provided, the new encoder will be loaded from this checkpoint instead of initializing from scratch.
             classifier_fusion_method: "concat" or "residual". "concat" concatenates embeddings and uses one classifier. "residual" uses NLND classifier + LD residual classifier.
+            use_language_embeddings: If True, concatenate language embeddings with LD encoder output before classifier
         """
         super().__init__()
         
@@ -320,6 +323,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         self.nlnd_gate = nn.Parameter(torch.tensor(-1.0))
         self.nlnd_drop_prob = float(nlnd_drop_prob)
         self.use_ld_masking = bool(use_ld_masking)
+        self.use_language_embeddings = bool(use_language_embeddings)
         
         if classifier_fusion_method not in ["concat", "residual"]:
             raise ValueError(f"classifier_fusion_method must be 'concat' or 'residual', got '{classifier_fusion_method}'")
@@ -350,11 +354,26 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             self.config = AutoConfig.from_pretrained(base_model_name)
             self.new_encoder = AutoModel.from_pretrained(base_model_name)
         
+        # Language embedding layer (4 languages: en, zh, fr, ja)
+        self.num_languages = 4
+        self.language_embedding_dim = 32  # Embedding dimension for language
+        self.language_to_idx = {'en': 0, 'zh': 1, 'fr': 2, 'ja': 3}
+        
+        if self.use_language_embeddings:
+            self.language_embeddings = nn.Embedding(self.num_languages, self.language_embedding_dim)
+            print(f"Language embeddings enabled: {self.num_languages} languages, embedding_dim={self.language_embedding_dim}")
+        else:
+            self.language_embeddings = None
+            print("Language embeddings disabled")
+        
         # Setup classifier based on fusion method
         if classifier_fusion_method == "concat":
             # Classification head on concatenated features
             # Each encoder outputs hidden_size dim, so concatenated is 2 * hidden_size
+            # If using language embeddings, add them to LD encoder output before concatenation
             combined_dim = self.config.hidden_size * 2
+            if self.use_language_embeddings:
+                combined_dim += self.language_embedding_dim
             self.classifier = nn.Linear(combined_dim, num_classes)
             self.pretrained_classifier = None
             self.ld_classifier = None
@@ -375,8 +394,14 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 print("NLND classifier trainable")
             
             # Create new LD classifier for residual prediction
-            print(f"Creating LD residual classifier")
-            self.ld_classifier = nn.Linear(self.config.hidden_size, num_classes) # Concatenated output of pretrained and new encoders
+            # LD classifier input: LD encoder output (+ language embeddings if enabled)
+            ld_input_dim = self.config.hidden_size
+            if self.use_language_embeddings:
+                ld_input_dim += self.language_embedding_dim
+                print(f"Creating LD residual classifier with language embeddings (input_dim={ld_input_dim})")
+            else:
+                print(f"Creating LD residual classifier without language embeddings (input_dim={ld_input_dim})")
+            self.ld_classifier = nn.Linear(ld_input_dim, num_classes)
             self.pretrained_classifier = None
             self.classifier = None
         
@@ -384,7 +409,11 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights for the classifier layer(s)."""
+        """Initialize weights for the classifier layer(s) and language embeddings."""
+        # Initialize language embeddings if enabled
+        if self.use_language_embeddings and self.language_embeddings is not None:
+            nn.init.normal_(self.language_embeddings.weight, mean=0.0, std=0.02)
+        
         if self.classifier_fusion_method == "concat":
             nn.init.xavier_uniform_(self.classifier.weight)
             nn.init.zeros_(self.classifier.bias)
@@ -397,13 +426,28 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             nn.init.xavier_uniform_(self.ld_classifier.weight)
             nn.init.zeros_(self.ld_classifier.bias)
     
+    def _get_language_indices(self, languages: List[str]) -> torch.Tensor:
+        """
+        Convert language codes to indices.
+        
+        Args:
+            languages: List of language codes (e.g., ['en', 'fr', 'zh'])
+            
+        Returns:
+            Tensor of language indices [batch_size]
+        """
+        device = next(self.parameters()).device
+        indices = [self.language_to_idx.get(lang, 0) for lang in languages]
+        return torch.tensor(indices, dtype=torch.long, device=device)
+    
     def forward(
         self,
         input_ids_translated: Tensor,
         attention_mask_translated: Tensor,
         input_ids_original: Tensor,
         attention_mask_original: Tensor,
-        labels: Tensor = None
+        labels: Tensor = None,
+        languages: List[str] = None
     ) -> dict:
         """
         Forward pass through dual-encoder model.
@@ -414,11 +458,25 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             input_ids_original: Token IDs for original text [batch_size, seq_len]
             attention_mask_original: Attention mask for original text [batch_size, seq_len]
             labels: True labels for computing loss (optional)
+            languages: List of language codes for each sample in the batch (optional, defaults to all 'en')
             
         Returns:
             Dictionary containing logits, predictions, and optionally loss
         """
-        # Forward through pre-trained encoder (frozen, translated text)
+        # Get language embeddings if enabled and languages are provided
+        if self.use_language_embeddings and self.language_embeddings is not None:
+            if languages is not None:
+                language_indices = self._get_language_indices(languages)
+                language_embeds = self.language_embeddings(language_indices)  # [batch_size, language_embedding_dim]
+            else:
+                # Default to English if not provided
+                batch_size = input_ids_original.size(0)
+                device = input_ids_original.device
+                language_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+                language_embeds = self.language_embeddings(language_indices)  # [batch_size, language_embedding_dim]
+        else:
+            language_embeds = None
+        # Forward through pre-trained encoder (frozen NLND encoder, translated text)
         # Set to eval mode and disable gradients for efficiency
         self.pretrained_encoder.eval()
         # We don't use no_grad here because we want to allow gradients through concatenation
@@ -429,14 +487,22 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             return_dict=True
         )
         pretrained_pooled = pretrained_outputs.last_hidden_state[:, 0, :].detach()  # [batch_size, hidden_size]
+        # NOTE: Language embeddings are NOT added to pretrained_pooled (NLND encoder output)
         
-        # Forward through new encoder (trainable, original text)
+        # Forward through new encoder (trainable LD encoder, original text)
         new_outputs = self.new_encoder(
             input_ids=input_ids_original,
             attention_mask=attention_mask_original,
             return_dict=True
         )
         new_pooled = new_outputs.last_hidden_state[:, 0, :]  # [batch_size, hidden_size]
+        
+        # Concatenate language embeddings with LD encoder output ONLY (not NLND encoder output)
+        # Language embeddings are only used in the LD path
+        if self.use_language_embeddings and language_embeds is not None:
+            new_pooled_with_lang = torch.cat([new_pooled, language_embeds], dim=-1)  # [batch_size, hidden_size + language_embedding_dim]
+        else:
+            new_pooled_with_lang = new_pooled  # [batch_size, hidden_size]
         
         # Initialize logits_nlnd and logits_residual to None (will be set in residual method)
         logits_nlnd = None
@@ -467,7 +533,9 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 pretrained_pooled_for_concat = pretrained_pooled
             
             # Concatenate features from both encoders
-            combined_features = torch.cat([pretrained_pooled_for_concat, new_pooled], dim=-1)  # [batch_size, 2*hidden_size]
+            # NOTE: Language embeddings are ONLY in new_pooled_with_lang (LD side), not in pretrained_pooled_for_concat (NLND side)
+            # Structure: [NLND_encoder_output, LD_encoder_output + language_embeddings]
+            combined_features = torch.cat([pretrained_pooled_for_concat, new_pooled_with_lang], dim=-1)
             
             # Pass through classifier
             logits = self.classifier(combined_features)  # [batch_size, num_classes]
@@ -475,11 +543,12 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # Process LD encoder output through dense layer (no LD masking)
             # ld_processed = self.ld_dense(new_pooled)  # [batch_size, hidden_size]
             
-            # NLND classifier on pretrained encoder output
+            # NLND classifier on pretrained encoder output (NO language embeddings)
             logits_nlnd = self.nlnd_classifier(pretrained_pooled)  # [batch_size, num_classes]
             
-            # LD classifier on processed LD encoder output (predicts residual)
-            logits_residual = self.ld_classifier(new_pooled)  # [batch_size, num_classes]
+            # LD classifier on LD encoder output concatenated with language embeddings (predicts residual)
+            # NOTE: Language embeddings are ONLY used here in the LD classifier path
+            logits_residual = self.ld_classifier(new_pooled_with_lang)  # [batch_size, num_classes]
 
             # Add logits together
             logits = logits_nlnd + logits_residual  # [batch_size, num_classes]
@@ -520,7 +589,12 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 # Standard Cross-Entropy loss for concat method (no changes)
                 criterion = nn.CrossEntropyLoss()
                 loss = criterion(logits, labels)
-                output['loss'] = loss
+                penalty = self._compute_opposite_polarity_penalty_from_logits(logits, labels)
+                output['loss'] = loss + penalty
+                output['loss_components'] = {
+                    'loss': loss,
+                    'penalty': penalty,
+                }
         
         return output
     
@@ -576,8 +650,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # loss_nlnd.mean()  # NLND loss
             loss_combined_mean  # Combined loss
             + penalty_combined  # Combined opposite polarity penalty
-            - 10.0 * reward_mean  # Reward for loss decrease
-            - 5.0 *loss_decrease_mean  # Loss decrease
+            - 15.0 * reward_mean  # Reward for loss decrease
+            - 10.0 *loss_decrease_mean  # Loss decrease
         )
         
         return {
@@ -642,6 +716,10 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         # Save new encoder
         self.new_encoder.save_pretrained(f"{save_directory}/new_encoder")
         
+        # Save language embeddings if enabled
+        if self.use_language_embeddings and self.language_embeddings is not None:
+            torch.save(self.language_embeddings.state_dict(), f"{save_directory}/language_embeddings.pt")
+        
         # Save classifier(s) based on fusion method
         if self.classifier_fusion_method == "concat":
             torch.save(self.classifier.state_dict(), f"{save_directory}/classifier.pt")
@@ -658,7 +736,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 'num_classes': self.num_classes,
                 'model_type': 'dual_encoder',
                 'pretrained_encoder_path': self.pretrained_encoder_path,
-                'classifier_fusion_method': self.classifier_fusion_method
+                'classifier_fusion_method': self.classifier_fusion_method,
+                'use_language_embeddings': self.use_language_embeddings
             }, f)
         
         print(f"Model saved to {save_directory}")
@@ -683,10 +762,12 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 num_classes = config.get('num_classes', 3)
                 pretrained_path = pretrained_encoder_path or config.get('pretrained_encoder_path')
                 classifier_fusion_method = config.get('classifier_fusion_method', 'concat')
+                use_language_embeddings = config.get('use_language_embeddings', False)
         else:
             num_classes = 3
             pretrained_path = pretrained_encoder_path
             classifier_fusion_method = 'concat'
+            use_language_embeddings = False
         
         if pretrained_path is None:
             raise ValueError("pretrained_encoder_path must be provided")
@@ -696,13 +777,23 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             pretrained_encoder_path=pretrained_path,
             num_classes=num_classes,
             freeze_pretrained=True,
-            classifier_fusion_method=classifier_fusion_method
+            classifier_fusion_method=classifier_fusion_method,
+            use_language_embeddings=use_language_embeddings
         )
         
         # Load new encoder
         new_encoder_path = f"{save_directory}/new_encoder"
         if os.path.exists(new_encoder_path):
             model.new_encoder = AutoModel.from_pretrained(new_encoder_path)
+        
+        # Load language embeddings if enabled
+        if model.use_language_embeddings and model.language_embeddings is not None:
+            language_embeddings_path = f"{save_directory}/language_embeddings.pt"
+            if os.path.exists(language_embeddings_path):
+                if torch.cuda.is_available():
+                    model.language_embeddings.load_state_dict(torch.load(language_embeddings_path, weights_only=False))
+                else:
+                    model.language_embeddings.load_state_dict(torch.load(language_embeddings_path, map_location='cpu', weights_only=False))
         
         # Load classifier(s) based on fusion method
         if classifier_fusion_method == "concat":

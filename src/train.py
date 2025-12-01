@@ -140,11 +140,15 @@ class Trainer:
             if nlnd_drop_prob < 0.0 or nlnd_drop_prob >= 1.0:
                 raise ValueError(f"nlnd_drop_prob must be in [0, 1), got {nlnd_drop_prob}")
             
+            # Language embeddings option
+            use_language_embeddings = bool(config.get('model', {}).get('use_language_embeddings', False))
+            
             print(f"Initializing dual-encoder model...")
             print(f"Pre-trained encoder path: {pretrained_path}")
             print(f"Classifier fusion method: {classifier_fusion_method}")
             print(f"NLND drop prob: {nlnd_drop_prob}")
             print(f"Use LD masking on NLND embedding: {use_ld_masking}")
+            print(f"Use language embeddings: {use_language_embeddings}")
             
             self.model = DualEncoderXLMROBERTaRating(
                 pretrained_encoder_path=pretrained_path,
@@ -155,6 +159,7 @@ class Trainer:
                 classifier_fusion_method=classifier_fusion_method,
                 nlnd_drop_prob=nlnd_drop_prob,
                 use_ld_masking=use_ld_masking,
+                use_language_embeddings=use_language_embeddings,
             )
             self.model.to(self.device)
         else:
@@ -378,12 +383,16 @@ class Trainer:
                 input_ids_original = batch['input_ids_original'].to(self.device)
                 attention_mask_original = batch['attention_mask_original'].to(self.device)
                 
+                # Get language codes from batch
+                languages = batch.get('languages', None)
+                
                 output = self.model(
                     input_ids_translated=input_ids_translated,
                     attention_mask_translated=attention_mask_translated,
                     input_ids_original=input_ids_original,
                     attention_mask_original=attention_mask_original,
-                    labels=labels
+                    labels=labels,
+                    languages=languages
                 )
             else:
                 # Single encoder: standard forward pass
@@ -434,15 +443,20 @@ class Trainer:
             self.writer.add_scalar('Train/LearningRate', self.scheduler.get_last_lr()[0], global_step)
             
             # Log residual loss components if available
-            if self.training_schema == 'dual_encoder' and self.model.classifier_fusion_method == "residual":
-                loss_components = output.get('loss_components')
-                if loss_components is not None:
-                    self.writer.add_scalar('Train/Residual/Loss_NLND', loss_components['loss_nlnd'].item(), global_step)
-                    self.writer.add_scalar('Train/Residual/Loss_Combined', loss_components['loss_combined'].item(), global_step)
-                    self.writer.add_scalar('Train/Residual/Penalty_Combined', loss_components['penalty_combined'].item(), global_step)
-                    self.writer.add_scalar('Train/Residual/Reward', loss_components['reward'].item(), global_step)
-                    self.writer.add_scalar('Train/Residual/Loss_Decrease', loss_components['loss_decrease'].item(), global_step)
-            
+            if self.training_schema == 'dual_encoder':
+                if self.model.classifier_fusion_method == "residual":
+                    loss_components = output.get('loss_components')
+                    if loss_components is not None:
+                        self.writer.add_scalar('Train/Residual/Loss_NLND', loss_components['loss_nlnd'].item(), global_step)
+                        self.writer.add_scalar('Train/Residual/Loss_Combined', loss_components['loss_combined'].item(), global_step)
+                        self.writer.add_scalar('Train/Residual/Penalty_Combined', loss_components['penalty_combined'].item(), global_step)
+                        self.writer.add_scalar('Train/Residual/Reward', loss_components['reward'].item(), global_step)
+                        self.writer.add_scalar('Train/Residual/Loss_Decrease', loss_components['loss_decrease'].item(), global_step)
+                elif self.model.classifier_fusion_method == "concat":
+                    loss_components = output.get('loss_components')
+                    if loss_components is not None:
+                        self.writer.add_scalar('Train/Concat/Loss', loss_components['loss'].item(), global_step)
+                        self.writer.add_scalar('Train/Concat/Penalty', loss_components['penalty'].item(), global_step)
             # Evaluate at specified steps
             if eval_steps and global_step > 0 and global_step % eval_steps == 0:
                 print(f"\n{'='*50}")
@@ -507,12 +521,16 @@ class Trainer:
                     input_ids_original = batch['input_ids_original'].to(self.device)
                     attention_mask_original = batch['attention_mask_original'].to(self.device)
                     
+                    # Get language codes from batch
+                    languages = batch.get('languages', None)
+                    
                     output = self.model(
                         input_ids_translated=input_ids_translated,
                         attention_mask_translated=attention_mask_translated,
                         input_ids_original=input_ids_original,
                         attention_mask_original=attention_mask_original,
-                        labels=labels
+                        labels=labels,
+                        languages=languages
                     )
                 else:
                     # Single encoder: standard forward pass
@@ -530,11 +548,11 @@ class Trainer:
                 # Collect residual loss components if available
                 loss_components = output.get('loss_components')
                 if loss_components is not None:
-                    total_loss_nlnd += loss_components['loss_nlnd'].item()
-                    total_loss_combined += loss_components['loss_combined'].item()
-                    total_penalty_combined += loss_components['penalty_combined'].item()
-                    total_reward += loss_components['reward'].item()
-                    total_loss_decrease += loss_components['loss_decrease'].item()
+                    total_loss_nlnd += loss_components.get('loss_nlnd', 0.0).item()
+                    total_loss_combined += loss_components.get('loss_combined', 0.0).item()
+                    total_penalty_combined += loss_components.get('penalty_combined', 0.0).item()
+                    total_reward += loss_components.get('reward', 0.0).item()
+                    total_loss_decrease += loss_components.get('loss_decrease', 0.0).item()
                     num_batches_with_components += 1
 
                 # Apply the same KL penalty in evaluation loss if enabled
