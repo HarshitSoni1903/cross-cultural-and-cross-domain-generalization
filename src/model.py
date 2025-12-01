@@ -376,7 +376,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             
             # Create new LD classifier for residual prediction
             print(f"Creating LD residual classifier")
-            self.ld_classifier = nn.Linear(self.config.hidden_size, num_classes)
+            self.ld_classifier = nn.Linear(self.config.hidden_size * 2, num_classes) # Concatenated output of pretrained and new encoders
             self.pretrained_classifier = None
             self.classifier = None
         
@@ -479,7 +479,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             logits_nlnd = self.nlnd_classifier(pretrained_pooled)  # [batch_size, num_classes]
             
             # LD classifier on processed LD encoder output (predicts residual)
-            logits_residual = self.ld_classifier(new_pooled)  # [batch_size, num_classes]
+            combined_features = torch.cat([pretrained_pooled, new_pooled], dim=-1)  # [batch_size, 2*hidden_size]
+            logits_residual = self.ld_classifier(combined_features)  # [batch_size, num_classes]
 
             # Add logits together
             logits = logits_nlnd + logits_residual  # [batch_size, num_classes]
