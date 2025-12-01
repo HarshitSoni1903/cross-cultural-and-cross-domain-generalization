@@ -338,11 +338,23 @@ class Trainer:
             num_training_steps=num_training_steps
         )
     
-    def train_epoch(self, epoch: int):
-        """Train for one epoch."""
+    def train_epoch(self, epoch: int, global_step_start: int = 0, best_val_loss: float = float('inf')):
+        """
+        Train for one epoch.
+        
+        Args:
+            epoch: Current epoch number
+            global_step_start: Starting global step number (for step-based evaluation)
+            best_val_loss: Current best validation loss (for checkpoint saving)
+            
+        Returns:
+            Tuple of (avg_loss, updated best_val_loss)
+        """
         self.model.train()
         total_loss = 0.0
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        
+        eval_steps = self.config['data'].get('eval_steps', None)
         
         for step, batch in enumerate(progress_bar):
             # Get labels (always classification labels for dual-encoder, otherwise based on task_type)
@@ -415,7 +427,7 @@ class Trainer:
             progress_bar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / (step + 1)})
             
             # Calculate global step for TensorBoard
-            global_step = (epoch - 1) * len(self.train_loader) + step
+            global_step = global_step_start + step
             
             # TensorBoard logging
             self.writer.add_scalar('Train/Loss', loss.item(), global_step)
@@ -430,17 +442,31 @@ class Trainer:
                     self.writer.add_scalar('Train/Residual/Penalty_Combined', loss_components['penalty_combined'].item(), global_step)
                     self.writer.add_scalar('Train/Residual/Reward', loss_components['reward'].item(), global_step)
             
+            # Evaluate at specified steps
+            if eval_steps and global_step > 0 and global_step % eval_steps == 0:
+                print(f"\n{'='*50}")
+                print(f"Evaluation at step {global_step}")
+                print(f"{'='*50}")
+                val_metrics = self.evaluate(self.val_loader, "Validation", step=global_step)
+                print(f"\nValidation Metrics:")
+                self._print_metrics(val_metrics)
+                
+                # Save checkpoint if best validation loss
+                if val_metrics['loss'] < best_val_loss:
+                    best_val_loss = val_metrics['loss']
+                    self.save_checkpoint(step=global_step, metrics=val_metrics)
+                    print(f"\nBest validation loss so far: {best_val_loss:.4f}")
+            
             # Logging
             if step % self.config['data']['logging_steps'] == 0:
-                print(f"\nStep {step}, Loss: {loss.item():.4f}, LR: {self.scheduler.get_last_lr()[0]:.2e}")
+                print(f"\nStep {global_step}, Loss: {loss.item():.4f}, LR: {self.scheduler.get_last_lr()[0]:.2e}")
         
         avg_loss = total_loss / len(self.train_loader)
         # Log average training loss for the epoch
-        epoch_global_step = epoch * len(self.train_loader)
         self.writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
-        return avg_loss
+        return avg_loss, best_val_loss
     
-    def evaluate(self, dataloader: DataLoader, split_name: str = "Validation", epoch: int = None) -> Dict:
+    def evaluate(self, dataloader: DataLoader, split_name: str = "Validation", step: int = None, epoch: int = None) -> Dict:
         """Evaluate model on a dataset."""
         self.model.eval()
         total_loss = 0.0
@@ -590,27 +616,29 @@ class Trainer:
             }
             
             # TensorBoard logging for classification metrics
-            if epoch is not None:
+            # Use step if provided, otherwise fall back to epoch
+            log_step = step if step is not None else epoch
+            if log_step is not None:
                 tag_prefix = f"{split_name}/"
-                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}Precision_Macro', metrics['precision_macro'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}Recall_Macro', metrics['recall_macro'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}F1_Macro', metrics['f1_macro'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}F1_Weighted', metrics['f1_weighted'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}Precision_Macro', metrics['precision_macro'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}Recall_Macro', metrics['recall_macro'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}F1_Macro', metrics['f1_macro'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}F1_Weighted', metrics['f1_weighted'], log_step)
                 
                 # Log residual loss components if available
                 if num_batches_with_components > 0:
-                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_NLND', total_loss_nlnd / num_batches_with_components, epoch)
-                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_Combined', total_loss_combined / num_batches_with_components, epoch)
-                    self.writer.add_scalar(f'{tag_prefix}Residual/Penalty_Combined', total_penalty_combined / num_batches_with_components, epoch)
-                    self.writer.add_scalar(f'{tag_prefix}Residual/Reward', total_reward / num_batches_with_components, epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_NLND', total_loss_nlnd / num_batches_with_components, log_step)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_Combined', total_loss_combined / num_batches_with_components, log_step)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Penalty_Combined', total_penalty_combined / num_batches_with_components, log_step)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Reward', total_reward / num_batches_with_components, log_step)
                 
                 # Per-class metrics
                 for class_name, class_metric in class_metrics.items():
-                    self.writer.add_scalar(f'{tag_prefix}Precision_{class_name}', class_metric['precision'], epoch)
-                    self.writer.add_scalar(f'{tag_prefix}Recall_{class_name}', class_metric['recall'], epoch)
-                    self.writer.add_scalar(f'{tag_prefix}F1_{class_name}', class_metric['f1'], epoch)
+                    self.writer.add_scalar(f'{tag_prefix}Precision_{class_name}', class_metric['precision'], log_step)
+                    self.writer.add_scalar(f'{tag_prefix}Recall_{class_name}', class_metric['recall'], log_step)
+                    self.writer.add_scalar(f'{tag_prefix}F1_{class_name}', class_metric['f1'], log_step)
         else:
             # Regression metrics - use original star ratings (1-5)
             all_predictions = torch.tensor(all_predictions, dtype=torch.float32)
@@ -648,20 +676,27 @@ class Trainer:
             }
             
             # TensorBoard logging for regression metrics
-            if epoch is not None:
+            # Use step if provided, otherwise fall back to epoch
+            log_step = step if step is not None else epoch
+            if log_step is not None:
                 tag_prefix = f"{split_name}/"
-                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}MAE', metrics['mae'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}MSE', metrics['mse'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}RMSE', metrics['rmse'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}R2', metrics['r2'], epoch)
-                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], epoch)
+                self.writer.add_scalar(f'{tag_prefix}Loss', metrics['loss'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}MAE', metrics['mae'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}MSE', metrics['mse'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}RMSE', metrics['rmse'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}R2', metrics['r2'], log_step)
+                self.writer.add_scalar(f'{tag_prefix}Accuracy', metrics['accuracy'], log_step)
         
         return metrics
     
-    def save_checkpoint(self, epoch: int, metrics: Dict = None):
+    def save_checkpoint(self, step: int = None, epoch: int = None, metrics: Dict = None):
         """Save model checkpoint."""
-        checkpoint_dir = self.output_dir / f"checkpoint-epoch-{epoch}"
+        if step is not None:
+            checkpoint_dir = self.output_dir / f"checkpoint-step-{step}"
+        elif epoch is not None:
+            checkpoint_dir = self.output_dir / f"checkpoint-epoch-{epoch}"
+        else:
+            raise ValueError("Either step or epoch must be provided")
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Save model
@@ -738,33 +773,45 @@ class Trainer:
         print(f"Validation samples: {len(self.val_loader.dataset)}")
         print(f"Number of epochs: {self.config['training']['num_epochs']}")
         print(f"Batch size: {self.config['training']['batch_size']}")
+        
+        # Get evaluation configuration
+        eval_steps = self.config['data'].get('eval_steps', None)
+        if eval_steps:
+            print(f"Evaluation frequency: every {eval_steps} steps")
+        else:
+            print("Evaluation frequency: at the end of each epoch")
         print("="*50 + "\n")
         
         best_val_loss = float('inf')
+        global_step = 0
         
         for epoch in range(1, self.config['training']['num_epochs'] + 1):
-            # Train
-            train_loss = self.train_epoch(epoch)
+            # Train epoch (evaluation happens inside train_epoch if eval_steps is set)
+            train_loss, best_val_loss = self.train_epoch(epoch, global_step_start=global_step, best_val_loss=best_val_loss)
             print(f"\nEpoch {epoch} - Train Loss: {train_loss:.4f}")
             
-            # Evaluate
-            val_metrics = self.evaluate(self.val_loader, "Validation", epoch=epoch)
-            print(f"\nValidation Metrics:")
-            self._print_metrics(val_metrics)
+            # Update global step
+            global_step += len(self.train_loader)
             
-            # Save checkpoint
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
-                self.save_checkpoint(epoch, val_metrics)
-                print(f"\nBest validation loss so far: {best_val_loss:.4f}")
+            # Evaluate at end of epoch only if eval_steps is not set (fallback to epoch-based evaluation)
+            if not eval_steps:
+                val_metrics = self.evaluate(self.val_loader, "Validation", epoch=epoch)
+                print(f"\nValidation Metrics:")
+                self._print_metrics(val_metrics)
+                
+                # Save checkpoint
+                if val_metrics['loss'] < best_val_loss:
+                    best_val_loss = val_metrics['loss']
+                    self.save_checkpoint(epoch=epoch, metrics=val_metrics)
+                    print(f"\nBest validation loss so far: {best_val_loss:.4f}")
         
         print("\n" + "="*50)
         print("Training Complete!")
         print("="*50)
         
-        # Final evaluation on test set
+        # Final evaluation on test set (use global step for logging)
         print("\nEvaluating on test set...")
-        test_metrics = self.evaluate(self.test_loader, "Test", epoch=self.config['training']['num_epochs'])
+        test_metrics = self.evaluate(self.test_loader, "Test", step=global_step)
         print(f"\nTest Metrics:")
         self._print_metrics(test_metrics)
         
