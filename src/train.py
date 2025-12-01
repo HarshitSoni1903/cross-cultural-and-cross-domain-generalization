@@ -441,6 +441,7 @@ class Trainer:
                     self.writer.add_scalar('Train/Residual/Loss_Combined', loss_components['loss_combined'].item(), global_step)
                     self.writer.add_scalar('Train/Residual/Penalty_Combined', loss_components['penalty_combined'].item(), global_step)
                     self.writer.add_scalar('Train/Residual/Reward', loss_components['reward'].item(), global_step)
+                    self.writer.add_scalar('Train/Residual/Loss_Decrease', loss_components['loss_decrease'].item(), global_step)
             
             # Evaluate at specified steps
             if eval_steps and global_step > 0 and global_step % eval_steps == 0:
@@ -479,6 +480,7 @@ class Trainer:
         total_loss_combined = 0.0
         total_penalty_combined = 0.0
         total_reward = 0.0
+        total_loss_decrease = 0.0
         num_batches_with_components = 0
         
         with torch.no_grad():
@@ -532,6 +534,7 @@ class Trainer:
                     total_loss_combined += loss_components['loss_combined'].item()
                     total_penalty_combined += loss_components['penalty_combined'].item()
                     total_reward += loss_components['reward'].item()
+                    total_loss_decrease += loss_components['loss_decrease'].item()
                     num_batches_with_components += 1
 
                 # Apply the same KL penalty in evaluation loss if enabled
@@ -633,6 +636,7 @@ class Trainer:
                     self.writer.add_scalar(f'{tag_prefix}Residual/Loss_Combined', total_loss_combined / num_batches_with_components, log_step)
                     self.writer.add_scalar(f'{tag_prefix}Residual/Penalty_Combined', total_penalty_combined / num_batches_with_components, log_step)
                     self.writer.add_scalar(f'{tag_prefix}Residual/Reward', total_reward / num_batches_with_components, log_step)
+                    self.writer.add_scalar(f'{tag_prefix}Residual/Loss_Decrease', total_loss_decrease / num_batches_with_components, log_step)
                 
                 # Per-class metrics
                 for class_name, class_metric in class_metrics.items():

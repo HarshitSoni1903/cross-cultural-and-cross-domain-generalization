@@ -514,6 +514,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                     'loss_combined': loss_dict['loss_combined'],
                     'penalty_combined': loss_dict['penalty_combined'],
                     'reward': loss_dict['reward'],
+                    'loss_decrease': loss_dict['loss_decrease'],
                 }
             else:
                 # Standard Cross-Entropy loss for concat method (no changes)
@@ -561,8 +562,11 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         # Reward is proportional to the loss decrease
         loss_decrease = loss_nlnd - loss_combined  # [batch_size]
         # Only reward when loss decreases (loss_decrease > 0)
-        # reward = torch.clamp(loss_decrease, min=0.0)  # [batch_size], only positive values
-        reward_mean = loss_decrease.mean()  # Scalar
+        loss_decrease = torch.clamp(loss_decrease)
+        loss_decrease_mean = loss_decrease.mean()
+
+        reward = torch.clamp(loss_decrease_mean, min=0.0, max=0.05)  # [batch_size], only positive values
+        reward_mean = reward.mean()  # Scalar
         
         # 4. Add opposite polarity penalty based on logit values (not predictions)
         # Penalty applies even when predictions are correct
@@ -573,7 +577,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # loss_nlnd.mean()  # NLND loss
             loss_combined_mean  # Combined loss
             + penalty_combined  # Combined opposite polarity penalty
-            - 15.0 * reward_mean  # Reward for loss decrease (subtract to reduce loss)
+            - 10.0 * reward_mean  # Reward for loss decrease
+            - 5.0 *loss_decrease_mean  # Loss decrease
         )
         
         return {
@@ -582,6 +587,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             'loss_combined': loss_combined_mean,
             'penalty_combined': penalty_combined,
             'reward': reward_mean,
+            'loss_decrease': loss_decrease_mean,
         }
         
     def _compute_opposite_polarity_penalty_from_logits(self, logits: Tensor, labels: Tensor) -> Tensor:
