@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from amazon_review_dataset import create_train_dataloader, create_amazon_review_dataloaders
 from model import XLMROBERTaRating, DualEncoderXLMROBERTaRating
 
+from eval_model import run_tsne_umap
+
 
 def get_available_languages(data_path: str) -> List[str]:
     """
@@ -187,6 +189,24 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=str(log_dir))
         self.log_dir = log_dir
         print(f"TensorBoard logs will be saved to: {log_dir}")
+
+        # ============================================
+        # Save a copy of the config & print it
+        # ============================================
+        config_save_path = self.output_dir / "config_used.yaml"
+        with open(config_save_path, "w") as f:
+            yaml.dump(self.config, f, sort_keys=False)
+        
+        print("\n===== CONFIGURATION (ACTIVE) =====")
+        print(yaml.dump(self.config, sort_keys=False))
+        print("==================================\n")
+        
+        # Log config into TensorBoard text tab
+        try:
+            self.writer.add_text("Config", f"```\n{yaml.dump(self.config, sort_keys=False)}\n```")
+        except Exception as e:
+            print(f"Warning: Could not write config to TensorBoard: {e}")
+
     
     def setup_data(self):
         """Setup train, validation, and test dataloaders using amazon_review_dataset."""
@@ -387,22 +407,55 @@ class Trainer:
             loss = output['loss']
 
             # Optional KL penalty between LD encoder (new_encoder) and frozen NLND encoder
+            # =====================================================
+            # KL REGULARIZATION: conditional / always / never
+            # =====================================================
             if (
                 self.training_schema == 'dual_encoder'
                 and self.use_ld_kl_penalty
                 and self.ld_kl_weight > 0.0
             ):
-                pretrained_pooled = output.get('pretrained_pooled')
-                new_pooled = output.get('new_pooled')
-                if pretrained_pooled is not None and new_pooled is not None:
-                    # Treat pooled outputs as unnormalized logits over hidden dimension
-                    # KL(new || pretrained) where pretrained acts as (frozen) target distribution
-                    log_p_new = F.log_softmax(new_pooled, dim=-1)
-                    p_pretrained = F.softmax(pretrained_pooled.detach(), dim=-1)
-                    kl_div = F.kl_div(log_p_new, p_pretrained, reduction='batchmean')
-                    # Clip KL so auxiliary term cannot overwhelm main task loss
-                    kl_div_clipped = torch.clamp(kl_div, max=self.ld_kl_clip)
-                    loss = loss - self.ld_kl_weight * kl_div_clipped
+                logits_pretrained = output.get("logits_pretrained")
+                logits_new = output.get("logits_new")
+                pooled_pretrained = output.get("pretrained_pooled")
+                pooled_new = output.get("new_pooled")
+
+                # Must have both branches available
+                if logits_pretrained is not None and logits_new is not None:
+
+                    ce_fn = torch.nn.CrossEntropyLoss()
+                    ce_pre = ce_fn(logits_pretrained, labels)
+                    ce_new = ce_fn(logits_new, labels)
+
+                    apply_kl = False
+                    kl_type = self.config["training"].get("ld_kl_type", "never")
+
+                    if kl_type == "always":
+                        apply_kl = True
+
+                    elif kl_type == "conditional":
+                        margin = self.config["training"].get("ld_kl_margin", 0.0)
+                        if ce_new > ce_pre + margin:
+                            apply_kl = True
+
+                    if apply_kl:
+                        kl_source = self.config["training"].get("ld_kl_source", "logits")
+
+                        # KL on logits
+                        if kl_source == "logits":
+                            log_p_new = F.log_softmax(logits_new, dim=-1)
+                            p_pre = F.softmax(logits_pretrained.detach(), dim=-1)
+                            kl = F.kl_div(log_p_new, p_pre, reduction="batchmean")
+
+                        # KL on embeddings
+                        else:
+                            log_p_new = F.log_softmax(pooled_new, dim=-1)
+                            p_pre = F.softmax(pooled_pretrained.detach(), dim=-1)
+                            kl = F.kl_div(log_p_new, p_pre, reduction="batchmean")
+
+                        kl = torch.clamp(kl, max=self.ld_kl_clip)
+                        loss = loss + self.ld_kl_weight * kl
+
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -484,19 +537,34 @@ class Trainer:
                 loss = output['loss']
 
                 # Apply the same KL penalty in evaluation loss if enabled
+                # =====================================================
+                # KL REGULARIZATION (evaluation)
+                # =====================================================
                 if (
                     self.training_schema == 'dual_encoder'
                     and self.use_ld_kl_penalty
                     and self.ld_kl_weight > 0.0
                 ):
-                    pretrained_pooled = output.get('pretrained_pooled')
-                    new_pooled = output.get('new_pooled')
-                    if pretrained_pooled is not None and new_pooled is not None:
-                        log_p_new = F.log_softmax(new_pooled, dim=-1)
-                        p_pretrained = F.softmax(pretrained_pooled, dim=-1)
-                        kl_div = F.kl_div(log_p_new, p_pretrained, reduction='batchmean')
-                        kl_div_clipped = torch.clamp(kl_div, max=self.ld_kl_clip)
-                        loss = loss + self.ld_kl_weight * kl_div_clipped
+                    logits_pretrained = output.get("logits_pretrained")
+                    logits_new = output.get("logits_new")
+                    pooled_pretrained = output.get("pretrained_pooled")
+                    pooled_new = output.get("new_pooled")
+
+                    if logits_pretrained is not None and logits_new is not None:
+
+                        kl_source = self.config["training"].get("ld_kl_source", "logits")
+
+                        if kl_source == "logits":
+                            log_p_new = F.log_softmax(logits_new, dim=-1)
+                            p_pre = F.softmax(logits_pretrained, dim=-1)
+                            kl = F.kl_div(log_p_new, p_pre, reduction="batchmean")
+                        else:
+                            log_p_new = F.log_softmax(pooled_new, dim=-1)
+                            p_pre = F.softmax(pooled_pretrained, dim=-1)
+                            kl = F.kl_div(log_p_new, p_pre, reduction="batchmean")
+
+                        kl = torch.clamp(kl, max=self.ld_kl_clip)
+                        loss = loss + self.ld_kl_weight * kl
                 
                 # Collect predictions and labels
                 predictions = output['predictions'].cpu()
@@ -738,6 +806,8 @@ class Trainer:
         
         # Save test results to file
         self.save_test_results(test_metrics)
+        run_tsne_umap(model=self.model, tokenizer=self.tokenizer, dataloader=self.test_loader, device=self.device, output_dir=self.output_dir, max_points=self.config.get("evaluation", {}).get("max_points", 10000))
+
         
         # Close TensorBoard writer
         self.writer.close()

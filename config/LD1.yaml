@@ -35,7 +35,7 @@ training:
   ld_kl_weight: 0.01  # strength of KL regularization when enabled
   ld_kl_clip: 0.5     # maximum raw KL value before weighting (prevents auxiliary loss dominating)
   ld_kl_type: "conditional" # "conditional", "always", "never"
-  ld_kl_margin: 0.05   # LD must be worse than NLND by this margin
+  ld_kl_margin: 0.07   # LD must be worse than NLND by this margin
   ld_kl_source: "logits"        # "logits" or "embeddings"
   
   
@@ -48,7 +48,3 @@ data:
   save_steps: 1000
   eval_steps: 1000
   logging_steps: 100
-
-evaluation:
-  max_points: 10000
-

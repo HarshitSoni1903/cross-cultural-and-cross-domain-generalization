@@ -428,6 +428,26 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             return_dict=True
         )
         new_pooled = new_outputs.last_hidden_state[:, 0, :]  # [batch_size, hidden_size]
+
+
+        logits_pretrained = None
+        logits_new = None
+    
+        if self.classifier_fusion_method == "concat":
+            # Split concat classifier weights: [W_pre | W_new]
+            W = self.classifier.weight      # [num_classes, 2*hidden]
+            b = self.classifier.bias        # [num_classes]
+    
+            hidden = self.config.hidden_size
+            W_pre = W[:, :hidden]
+            W_new = W[:, hidden:]
+    
+            logits_pretrained = pretrained_pooled @ W_pre.T + b
+            logits_new        = new_pooled        @ W_new.T + b
+    
+        else:   # residual mode
+            logits_pretrained = self.pretrained_classifier(pretrained_pooled)
+            logits_new        = self.ld_classifier(new_pooled)
         
         # Compute logits based on fusion method
         if self.classifier_fusion_method == "concat":
@@ -512,6 +532,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             # Expose pooled encoder outputs for optional auxiliary losses (e.g., KL regularization)
             'pretrained_pooled': pretrained_pooled,
             'new_pooled': new_pooled,
+            'logits_pretrained': logits_pretrained,
+            'logits_new': logits_new,     
         }
         
         # Compute Cross-Entropy loss if labels provided

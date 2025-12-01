@@ -107,7 +107,9 @@ def process_file(src_path: str, dst_path: str, tokenizer, model, args, lang_hint
     total, translated = 0, 0
     batch_texts, batch_objs = [], []
 
-    with gzip.open(src_path, "rt", encoding="utf-8") as src, open(dst_path, "a", encoding="utf-8") as dst:
+    opener = gzip.open if src_path.endswith(".gz") else open
+    
+    with opener(src_path, "rt", encoding="utf-8") as src, open(dst_path, "a", encoding="utf-8") as dst:
         for line in src:
             if not line.strip():
                 continue
@@ -186,6 +188,7 @@ def main():
 
     langs = args.languages[args.begin:]
     for lang in langs:
+        break
         for split in args.splits:
             rel = os.path.join("amazon_reviews_multi", lang, f"{split}.jsonl.gz")
             src_path = os.path.join(args.data_dir, rel)
@@ -195,6 +198,28 @@ def main():
                 continue
             process_file(src_path, dst_path, tok, mdl, args, lang)
 
+    LOGGER.info("Review Body Translation Complete")
+    
+    LOGGER.info("Review Title Translation")
+    
+    for lang in langs:
+        for split in args.splits:
+            src_path = os.path.join(args.output_root, "amazon_reviews_multi", lang, f"{split}.jsonl")
+            dst_path = os.path.join(
+                args.output_root, "amazon_reviews_multi", lang, f"{split}.titles.jsonl"
+            )
+
+            if not os.path.exists(src_path):
+                LOGGER.warning("Missing translated file: %s", src_path)
+                continue
+
+            # Override only for title translation
+            args.text_column = "review_title"
+            args.output_column = "review_title_en"
+
+            process_file(src_path, dst_path, tok, mdl, args, lang)
+    
+    
     LOGGER.info("All done.")
 
 if __name__ == "__main__":

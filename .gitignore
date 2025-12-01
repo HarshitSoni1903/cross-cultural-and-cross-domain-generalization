@@ -7,3 +7,5 @@ __pycache__/
 USAGE.md
 outputs/
 amazon_reviews_multi/
+data_temp/
+outputs_old/
