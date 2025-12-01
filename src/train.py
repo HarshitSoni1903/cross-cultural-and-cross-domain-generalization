@@ -74,9 +74,10 @@ def get_available_languages(data_path: str) -> List[str]:
 class Trainer:
     """Trainer class for model training and evaluation."""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, config_path: str = None):
         """Initialize trainer with configuration."""
         self.config = config
+        self.config_path = config_path  # Store path to original config file
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         
@@ -765,6 +766,21 @@ class Trainer:
         
         print(f"\nTest results saved to {results_path}")
     
+    def save_config(self):
+        """Save the config file used for training to the output directory."""
+        config_path = self.output_dir / "train_config.yaml"
+        
+        # If original config file exists, copy it
+        if self.config_path and Path(self.config_path).exists():
+            import shutil
+            shutil.copy2(self.config_path, config_path)
+            print(f"\nConfig file copied to {config_path}")
+        else:
+            # Otherwise, save the config dict as YAML
+            with open(config_path, 'w') as f:
+                yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+            print(f"\nConfig file saved to {config_path}")
+    
     def train(self):
         """Full training loop."""
         print("\n" + "="*50)
@@ -840,6 +856,9 @@ class Trainer:
         # Save test results to file
         self.save_test_results(test_metrics)
         
+        # Save config file used for training
+        self.save_config()
+        
         # Close TensorBoard writer
         self.writer.close()
         print(f"\nTensorBoard logs saved to: {self.log_dir}")
@@ -886,8 +905,8 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Create trainer and train
-    trainer = Trainer(config)
+    # Create trainer and train (pass config path for saving)
+    trainer = Trainer(config, config_path=args.config)
     trainer.train()
 
 
