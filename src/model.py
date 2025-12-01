@@ -562,7 +562,6 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         # Reward is proportional to the loss decrease
         loss_decrease = loss_nlnd - loss_combined  # [batch_size]
         # Only reward when loss decreases (loss_decrease > 0)
-        loss_decrease = torch.clamp(loss_decrease)
         loss_decrease_mean = loss_decrease.mean()
 
         reward = torch.clamp(loss_decrease_mean, min=0.0, max=0.05)  # [batch_size], only positive values
