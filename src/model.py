@@ -360,8 +360,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             self.ld_classifier = None
         else:  # residual
             # Create new dense layer for LD encoder output (no LD masking)
-            print(f"Creating dense layer for LD encoder output")
-            self.ld_dense = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+            # print(f"Creating dense layer for LD encoder output")
+            # self.ld_dense = nn.Linear(self.config.hidden_size, self.config.hidden_size)
             
             # Load NLND classifier from pretrained model
             print(f"Loading NLND classifier from pretrained model")
@@ -390,8 +390,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             nn.init.zeros_(self.classifier.bias)
         else:  # residual
             # Initialize dense layer weights
-            nn.init.xavier_uniform_(self.ld_dense.weight)
-            nn.init.zeros_(self.ld_dense.bias)
+            # nn.init.xavier_uniform_(self.ld_dense.weight)
+            # nn.init.zeros_(self.ld_dense.bias)
             # NLND classifier is loaded from pretrained checkpoint, so don't initialize
             # Initialize LD classifier weights
             nn.init.xavier_uniform_(self.ld_classifier.weight)
@@ -473,13 +473,13 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             logits = self.classifier(combined_features)  # [batch_size, num_classes]
         elif self.classifier_fusion_method == "residual":  # residual
             # Process LD encoder output through dense layer (no LD masking)
-            ld_processed = self.ld_dense(new_pooled)  # [batch_size, hidden_size]
+            # ld_processed = self.ld_dense(new_pooled)  # [batch_size, hidden_size]
             
             # NLND classifier on pretrained encoder output
             logits_nlnd = self.nlnd_classifier(pretrained_pooled)  # [batch_size, num_classes]
             
             # LD classifier on processed LD encoder output (predicts residual)
-            logits_residual = self.ld_classifier(ld_processed)  # [batch_size, num_classes]
+            logits_residual = self.ld_classifier(new_pooled)  # [batch_size, num_classes]
 
             # Add logits together
             logits = logits_nlnd + logits_residual  # [batch_size, num_classes]
@@ -561,8 +561,8 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         # Reward is proportional to the loss decrease
         loss_decrease = loss_nlnd - loss_combined  # [batch_size]
         # Only reward when loss decreases (loss_decrease > 0)
-        reward = torch.clamp(loss_decrease, min=0.0)  # [batch_size], only positive values
-        reward_mean = reward.mean()  # Scalar
+        # reward = torch.clamp(loss_decrease, min=0.0)  # [batch_size], only positive values
+        reward_mean = loss_decrease.mean()  # Scalar
         
         # 4. Add opposite polarity penalty based on logit values (not predictions)
         # Penalty applies even when predictions are correct
@@ -583,49 +583,51 @@ class DualEncoderXLMROBERTaRating(nn.Module):
             'penalty_combined': penalty_combined,
             'reward': reward_mean,
         }
-    
+        
     def _compute_opposite_polarity_penalty_from_logits(self, logits: Tensor, labels: Tensor) -> Tensor:
         """
-        Compute penalty for opposite polarity based on logit values (not predictions).
-        Penalizes high logits for opposite class even when prediction is correct.
-        
+        Opposite-polarity penalty using softmax probabilities.
+        Penalizes assigning high probability to the opposite sentiment class.
+
+        For 3-class sentiment: {0 = neg, 1 = neu, 2 = pos}:
+        - If label=0, penalize P(pos)
+        - If label=2, penalize P(neg)
+        - label=1 (neutral) has no penalty
+
         Args:
-            logits: Prediction logits [batch_size, num_classes]
-            labels: True labels [batch_size]
-            
+            logits: Tensor [batch_size, 3]
+            labels: Tensor [batch_size]
         Returns:
-            Penalty scalar (averaged over batch)
+            Scalar penalty.
         """
         batch_size = logits.size(0)
         if batch_size == 0:
             return torch.tensor(0.0, device=logits.device)
-        
-        # Initialize penalty per sample
+
+        # Convert logits → probabilities
+        probs = torch.softmax(logits, dim=-1)  # [B, 3]
+
         penalty_per_sample = torch.zeros(batch_size, device=logits.device)
-        
-        # When label is 0 (negative), penalize high logits for class 2 (positive)
-        # When label is 2 (positive), penalize high logits for class 0 (negative)
-        label_0_mask = (labels == 0)  # [batch_size]
-        label_2_mask = (labels == 2)  # [batch_size]
-        
-        # Penalty for label=0: high positive logit (class 2)
+
+        # Masks
+        label_0_mask = (labels == 0)  # negative samples
+        label_2_mask = (labels == 2)  # positive samples
+
+        # Label 0 → penalize P(pos)
         if label_0_mask.any():
-            # Get positive logits for samples with label=0
-            positive_logits = logits[label_0_mask, 2]  # [num_label_0]
-            # Use ReLU to only penalize positive logits (softmax will make them more likely)
-            penalty_per_sample[label_0_mask] = torch.clamp(positive_logits, min=0.0)
-        
-        # Penalty for label=2: high negative logit (class 0)
+            opp_prob = probs[label_0_mask, 2]  # P(class=2)
+            penalty_per_sample[label_0_mask] = opp_prob
+
+        # Label 2 → penalize P(neg)
         if label_2_mask.any():
-            # Get negative logits for samples with label=2
-            negative_logits = logits[label_2_mask, 0]  # [num_label_2]
-            # Use ReLU to only penalize positive logits (softmax will make them more likely)
-            penalty_per_sample[label_2_mask] = torch.clamp(negative_logits, min=0.0)
-        
-        # Average penalty over batch
+            opp_prob = probs[label_2_mask, 0]  # P(class=0)
+            penalty_per_sample[label_2_mask] = opp_prob
+
+        # Average over batch
         penalty = penalty_per_sample.mean()
-        
-        return penalty * 2  # Scale penalty weight
+
+        return penalty * 2.0  # scale penalty weight
+
     
     
     def save_pretrained(self, save_directory: str):
@@ -639,7 +641,7 @@ class DualEncoderXLMROBERTaRating(nn.Module):
         if self.classifier_fusion_method == "concat":
             torch.save(self.classifier.state_dict(), f"{save_directory}/classifier.pt")
         else:  # residual
-            torch.save(self.ld_dense.state_dict(), f"{save_directory}/ld_dense.pt")
+            # torch.save(self.ld_dense.state_dict(), f"{save_directory}/ld_dense.pt")
             # Save NLND classifier (loaded from pretrained, but may have been trained if freeze_pretrained=False)
             torch.save(self.nlnd_classifier.state_dict(), f"{save_directory}/nlnd_classifier.pt")
             torch.save(self.ld_classifier.state_dict(), f"{save_directory}/ld_classifier.pt")
@@ -706,12 +708,12 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 else:
                     model.classifier.load_state_dict(torch.load(classifier_path, map_location='cpu', weights_only=False))
         else:  # residual
-            ld_dense_path = f"{save_directory}/ld_dense.pt"
-            if os.path.exists(ld_dense_path):
-                if torch.cuda.is_available():
-                    model.ld_dense.load_state_dict(torch.load(ld_dense_path, weights_only=False))
-                else:
-                    model.ld_dense.load_state_dict(torch.load(ld_dense_path, map_location='cpu', weights_only=False))
+            # ld_dense_path = f"{save_directory}/ld_dense.pt"
+            # if os.path.exists(ld_dense_path):
+            #     if torch.cuda.is_available():
+            #         model.ld_dense.load_state_dict(torch.load(ld_dense_path, weights_only=False))
+            #     else:
+            #         model.ld_dense.load_state_dict(torch.load(ld_dense_path, map_location='cpu', weights_only=False))
             
             nlnd_classifier_path = f"{save_directory}/nlnd_classifier.pt"
             if os.path.exists(nlnd_classifier_path):
