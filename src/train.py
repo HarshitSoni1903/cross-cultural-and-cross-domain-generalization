@@ -407,6 +407,57 @@ class Trainer:
             loss = output['loss']
 
             # Optional KL penalty between LD encoder (new_encoder) and frozen NLND encoder
+            #########################################################
+            # FEATURE MATCHING + CONTRASTIVE ALIGNMENT (REPLACEMENT)
+            #########################################################
+            if self.training_schema == 'dual_encoder':
+            
+                # teacher / student hidden states
+                h_T = output.get("pretrained_pooled")      # frozen NLND encoder pooled
+                h_S = output.get("new_pooled")             # trainable LD encoder pooled
+            
+                # teacher logits (for conditional thresholding)
+                logits_T = output.get("logits_pretrained")
+                logits_S = output.get("logits_new")
+            
+                # teacher loss (for conditional trigger)
+                ce_fn = torch.nn.CrossEntropyLoss()
+                ce_teacher = ce_fn(logits_T, labels)
+            
+                # user config margin, default = 0
+                margin = float(self.config["training"].get("alignment_margin", 0.0))
+            
+                # student underperforms teacher? → apply alignment
+                apply_alignment = (loss > ce_teacher + margin)
+            
+                if apply_alignment:
+                    #
+                    # --- 1) FEATURE MATCHING (directional alignment) ---
+                    #
+                    h_T_norm = F.normalize(h_T.detach(), dim=-1)
+                    h_S_norm = F.normalize(h_S, dim=-1)
+            
+                    fm_loss = F.mse_loss(h_S_norm, h_T_norm)
+            
+                    lambda_fm = float(self.config["training"].get("fm_weight", 1.0))
+                    loss = loss + lambda_fm * fm_loss
+            
+                    #
+                    # --- 2) CONTRASTIVE ALIGNMENT (identity-level) ---
+                    #
+                    temp = float(self.config["training"].get("contrastive_temp", 0.05))
+            
+                    # batch-by-batch sim matrix
+                    sim_matrix = torch.matmul(h_S_norm, h_T_norm.T) / temp
+            
+                    batch_size = sim_matrix.size(0)
+                    labels_contrast = torch.arange(batch_size).to(self.device)
+            
+                    contrastive_loss = F.cross_entropy(sim_matrix, labels_contrast)
+            
+                    lambda_con = float(self.config["training"].get("contrastive_weight", 0.5))
+                    loss = loss + lambda_con * contrastive_loss
+
             # =====================================================
             # KL REGULARIZATION: conditional / always / never
             # =====================================================

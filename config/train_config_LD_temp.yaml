@@ -31,12 +31,16 @@ training:
   max_length: 512
   # Optional KL penalty between LD encoder (trainable) and frozen NLND encoder.
   # If omitted, defaults to not using this penalty and to clipping the KL at 1.0.
-  use_ld_kl_penalty: true
+  use_ld_kl_penalty: false
   ld_kl_weight: 0.01  # strength of KL regularization when enabled
-  ld_kl_clip: 0.5     # maximum raw KL value before weighting (prevents auxiliary loss dominating)
-  ld_kl_type: "conditional" # "conditional", "always", "never"
-  ld_kl_margin: 0.05   # LD must be worse than NLND by this margin
+  ld_kl_clip: 0.0 #0.5     # maximum raw KL value before weighting (prevents auxiliary loss dominating)
+  ld_kl_type: "never" # "conditional", "always", "never"
+  ld_kl_margin: 0.0 #0.05   # LD must be worse than NLND by this margin
   ld_kl_source: "logits"        # "logits" or "embeddings"
+  alignment_margin: 0.1       # when LD is worse than NLND + margin → apply alignment
+  fm_weight: 1              # strength of feature matching
+  contrastive_weight: 0.5     # strength of InfoNCE alignment
+  contrastive_temp: 0.05 
   
   
 data:

@@ -167,6 +167,7 @@ class AmazonReviewDataset(Dataset):
         }
         
         review_title = item.get('review_title', '')
+        review_title_en = item.get('review_title_en', '')
         product_category = item.get('product_category', '')
         
         # Add category prefix if domain_info is enabled
@@ -210,7 +211,7 @@ class AmazonReviewDataset(Dataset):
                     # For non-English: use translated text for frozen encoder
                     # Note: category prefix is always in English (original label)
                     text_for_translated_encoder = item['review_body_en']
-                    text_for_translated_encoder = f"{category_prefix}{review_title}\n{text_for_translated_encoder}"
+                    text_for_translated_encoder = f"{category_prefix}{review_title_en}\n{text_for_translated_encoder}"
                 
                 encoding_original = self.tokenizer(
                     text_original,

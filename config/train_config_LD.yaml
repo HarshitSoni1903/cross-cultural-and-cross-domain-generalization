@@ -23,7 +23,7 @@ model:
   use_ld_masking: false
   
 training:
-  batch_size: 16
+  batch_size: 32
   learning_rate: 0.00001
   num_epochs: 1
   warmup_steps: 500
