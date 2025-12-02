@@ -70,11 +70,17 @@ def _extract_embeddings(model, dataloader, device, max_points=8000):
             )
 
             # CLS vector — always hidden_states[0]
-            cls_emb = outputs.last_hidden_state[:, 0, :]  # [bs, H]
-            cls_emb = torch.nn.functional.normalize(cls_emb, p=2, dim=1)
-
+            # cls_emb = outputs.last_hidden_state[:, 0, :]  # [bs, H]
+            # cls_emb = torch.nn.functional.normalize(cls_emb, p=2, dim=1)
+            
+            if "new_pooled" in outputs:
+                pooled = outputs["new_pooled"]
+            else:
+                pooled = outputs.last_hidden_state[:, 0, :]
+                
+            pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
             labels = batch["labels"].cpu().numpy()
-            all_embeds.append(cls_emb.cpu().numpy())
+            all_embeds.append(pooled.cpu().numpy())
             all_labels.append(labels)
 
     embeddings = np.vstack(all_embeds)

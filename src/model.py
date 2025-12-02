@@ -225,6 +225,8 @@ class XLMROBERTaRating(nn.Module):
         # Pass through regression head
         rating_output = self.rating_head(pooled_output, labels)
         
+        rating_output["new_pooled"] = pooled_output
+        
         return rating_output
     
     def save_pretrained(self, save_directory: str):
