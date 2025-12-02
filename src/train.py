@@ -549,12 +549,17 @@ class Trainer:
                 # Collect residual loss components if available
                 loss_components = output.get('loss_components')
                 if loss_components is not None:
-                    total_loss_nlnd += loss_components.get('loss_nlnd', 0.0).item()
-                    total_loss_combined += loss_components.get('loss_combined', 0.0).item()
-                    total_penalty_combined += loss_components.get('penalty_combined', 0.0).item()
-                    total_reward += loss_components.get('reward', 0.0).item()
-                    total_loss_decrease += loss_components.get('loss_decrease', 0.0).item()
-                    num_batches_with_components += 1
+                    if self.model.classifier_fusion_method == "residual":
+                        total_loss_nlnd += loss_components['loss_nlnd'].item()
+                        total_loss_combined += loss_components['loss_combined'].item()
+                        total_penalty_combined += loss_components['penalty_combined'].item()
+                        total_reward += loss_components['reward'].item()
+                        total_loss_decrease += loss_components['loss_decrease'].item()
+                        num_batches_with_components += 1
+                    elif self.model.classifier_fusion_method == "concat":
+                        total_loss += loss_components['loss'].item()
+                        total_penalty += loss_components['penalty'].item()
+                        num_batches_with_components += 1
 
                 # Apply the same KL penalty in evaluation loss if enabled
                 if (
