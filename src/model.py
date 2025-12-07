@@ -589,11 +589,11 @@ class DualEncoderXLMROBERTaRating(nn.Module):
                 # Standard Cross-Entropy loss for concat method (no changes)
                 criterion = nn.CrossEntropyLoss()
                 loss = criterion(logits, labels)
-                penalty = self._compute_opposite_polarity_penalty_from_logits(logits, labels)
-                output['loss'] = loss + penalty
+                # penalty = self._compute_opposite_polarity_penalty_from_logits(logits, labels)
+                output['loss'] = loss
                 output['loss_components'] = {
                     'loss': loss,
-                    'penalty': penalty,
+                    # 'penalty': penalty,
                 }
         
         return output

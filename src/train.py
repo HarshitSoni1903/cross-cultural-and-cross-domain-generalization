@@ -558,7 +558,7 @@ class Trainer:
                         num_batches_with_components += 1
                     elif self.model.classifier_fusion_method == "concat":
                         total_loss += loss_components['loss'].item()
-                        total_penalty_combined += loss_components['penalty'].item()
+                        # total_penalty_combined += loss_components['penalty'].item()
                         num_batches_with_components += 1
 
                 # Apply the same KL penalty in evaluation loss if enabled
