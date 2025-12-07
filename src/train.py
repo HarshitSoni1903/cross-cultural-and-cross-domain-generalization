@@ -836,17 +836,16 @@ class Trainer:
             # Update global step
             global_step += len(self.train_loader)
             
-            # Evaluate at end of epoch only if eval_steps is not set (fallback to epoch-based evaluation)
-            if not eval_steps:
-                val_metrics = self.evaluate(self.val_loader, "Validation", epoch=epoch)
-                print(f"\nValidation Metrics:")
-                self._print_metrics(val_metrics)
-                
-                # Save checkpoint
-                if val_metrics['loss'] < best_val_loss:
-                    best_val_loss = val_metrics['loss']
-                    self.save_checkpoint(epoch=epoch, metrics=val_metrics)
-                    print(f"\nBest validation loss so far: {best_val_loss:.4f}")
+            # Evaluate on validation set
+            val_metrics = self.evaluate(self.val_loader, "Validation", epoch=epoch)
+            print(f"\nValidation Metrics:")
+            self._print_metrics(val_metrics)
+            
+            # Save checkpoint
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                self.save_checkpoint(epoch=epoch, metrics=val_metrics)
+                print(f"\nBest validation loss so far: {best_val_loss:.4f}")
         
         print("\n" + "="*50)
         print("Training Complete!")
